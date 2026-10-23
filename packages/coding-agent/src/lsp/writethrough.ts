@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { isEnoent, isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
 import { isPermissionDeniedError, writeFileWithFallback } from "../tools/file-write-fallback";
@@ -25,7 +26,7 @@ import {
 } from "./diagnostics";
 import { type FileDiagnosticsResult, FileFormatResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { notifyFileSaved, splitServers, syncFileContent } from "./servers";
-import type { LspClient, ServerConfig } from "./types";
+import type { LspClient, LspPolicy, ServerConfig } from "./types";
 import { summarizeDiagnosticMessages } from "./utils";
 
 const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
@@ -47,15 +48,15 @@ async function reloadTypeScriptProjectsAfterCreate(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
-	{ createMissing = true }: { createMissing?: boolean } = {},
+	{ createMissing = true, policy }: { createMissing?: boolean; policy?: LspPolicy } = {},
 ): Promise<void> {
 	await Promise.all(
 		servers.map(async ([, serverConfig]) => {
 			let client: LspClient | undefined;
 			try {
 				client = createMissing
-					? await getOrCreateClient(serverConfig, cwd, undefined, signal)
-					: await getActiveOrPendingClient(serverConfig, cwd, signal);
+					? await getOrCreateClient(serverConfig, cwd, undefined, signal, policy)
+					: await getActiveOrPendingClient(serverConfig, cwd, signal, policy);
 			} catch {
 				signal?.throwIfAborted();
 				return;
@@ -84,6 +85,7 @@ async function reloadTypeScriptProjectsAfterCreate(
 
 /** Options for creating the LSP writethrough callback */
 export interface WritethroughOptions {
+	policy?: LspPolicy;
 	/** Whether to format the file using LSP after writing */
 	enableFormat?: boolean;
 	/** Whether to get LSP diagnostics after writing */
@@ -100,6 +102,7 @@ export interface WritethroughOptions {
 
 /** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
 type ResolvedWritethroughOptions = {
+	policy?: LspPolicy;
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
@@ -276,6 +279,7 @@ async function scheduleDeferredDiagnosticsFetch(args: {
 	dst: string;
 	cwd: string;
 	servers: Array<[string, ServerConfig]>;
+	policy?: LspPolicy;
 	minVersions: ServerVersionMap | undefined;
 	expectedDocumentVersions: ServerVersionMap | undefined;
 	waitMs: number;
@@ -286,6 +290,7 @@ async function scheduleDeferredDiagnosticsFetch(args: {
 		const deferredTimeout = AbortSignal.timeout(Math.max(25_000, args.waitMs + DIAGNOSTICS_PIPELINE_GRACE_MS));
 		const combined = AbortSignal.any([args.signal, deferredTimeout]);
 		const diagnostics = await getDiagnosticsForFile(args.dst, args.cwd, args.servers, {
+			policy: args.policy,
 			signal: combined,
 			minVersions: args.minVersions,
 			expectedDocumentVersions: args.expectedDocumentVersions,
@@ -316,6 +321,7 @@ async function fetchDiagnosticsWithDeferral(args: {
 	dst: string;
 	cwd: string;
 	servers: Array<[string, ServerConfig]>;
+	policy?: LspPolicy;
 	minVersions: ServerVersionMap | undefined;
 	expectedDocumentVersions: ServerVersionMap | undefined;
 	transformDiagnostics?: ResolvedWritethroughOptions["transformDiagnostics"];
@@ -330,6 +336,7 @@ async function fetchDiagnosticsWithDeferral(args: {
 		minVersions,
 		expectedDocumentVersions,
 		transformDiagnostics,
+		policy,
 		deferredWaitMs,
 		deferred,
 		signal,
@@ -341,6 +348,7 @@ async function fetchDiagnosticsWithDeferral(args: {
 		// No late-injection channel: block for the standard budget and return inline.
 		return apply(
 			await getDiagnosticsForFile(dst, cwd, servers, {
+				policy,
 				signal,
 				minVersions,
 				expectedDocumentVersions,
@@ -350,6 +358,7 @@ async function fetchDiagnosticsWithDeferral(args: {
 
 	// One background fetch with a generous inner budget; await it only briefly inline.
 	const fetchPromise = getDiagnosticsForFile(dst, cwd, servers, {
+		policy,
 		signal: deferred.signal,
 		minVersions,
 		expectedDocumentVersions,
@@ -387,7 +396,10 @@ async function runLspWritethrough(
 	},
 	runOptions?: RunLspWritethroughOptions,
 ): Promise<WritethroughResult> {
-	const { enableFormat, enableDiagnostics } = options;
+	const { enableDiagnostics, policy } = options;
+	let enableFormat = options.enableFormat;
+	let formatter: FileFormatResult | undefined;
+	let formatDenied = false;
 	const contentAlreadyWritten = runOptions?.contentAlreadyWritten ?? false;
 
 	let finalContent = content;
@@ -433,17 +445,49 @@ async function runLspWritethrough(
 		await notifyWriteCommitted();
 		return { finalContent, diagnostics: undefined };
 	}
+	if (enableFormat && policy) {
+		try {
+			await policy.beforeEdit(
+				{
+					origin: "format",
+					cwd: path.resolve(cwd),
+					changes: [{ kind: "edit", path: path.resolve(dst) }],
+				},
+				signal,
+			);
+			signal?.throwIfAborted();
+		} catch {
+			formatDenied = true;
+			enableFormat = false;
+			formatter = FileFormatResult.FAILED;
+		}
+	}
+	if (formatDenied && !enableDiagnostics) {
+		await commitWrite();
+		await notifyWriteCommitted();
+		return {
+			finalContent,
+			diagnostics: {
+				server: servers.map(([name]) => name).join(", "),
+				messages: [],
+				summary: "OK",
+				errored: false,
+				formatter: FileFormatResult.FAILED,
+			},
+		};
+	}
 	const { lspServers, customLinterServers } = splitServers(servers);
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 
 	// Capture diagnostic versions BEFORE syncing to detect stale diagnostics
 	// Bound client creation by the writethrough budget: a hung/broken server
 	// must not add its full init wait (30s default) to every edit.
-	const minVersionsPromise = enableDiagnostics ? captureDiagnosticVersions(cwd, servers, 5_000, signal) : undefined;
+	const minVersionsPromise = enableDiagnostics
+		? captureDiagnosticVersions(cwd, servers, 5_000, signal, policy)
+		: undefined;
 	let minVersions = useCustomFormatter ? undefined : await minVersionsPromise;
 	let expectedDocumentVersions: ServerVersionMap | undefined;
 
-	let formatter: FileFormatResult | undefined;
 	let diagnostics: FileDiagnosticsResult | undefined;
 	let timedOut = false;
 	let synced = false;
@@ -468,7 +512,7 @@ async function runLspWritethrough(
 				// supports implementations that inspect the file before formatting.
 				if (diskContent !== content) await writeContent(content);
 				const [formattedContent, capturedVersions] = await Promise.all([
-					formatContent(dst, content, cwd, customLinterServers, operationSignal),
+					formatContent(dst, content, cwd, customLinterServers, operationSignal, policy),
 					minVersionsPromise,
 				]);
 				finalContent = formattedContent.content;
@@ -485,9 +529,10 @@ async function runLspWritethrough(
 				if (changeType === FileChangeType.Created) {
 					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal, {
 						createMissing: enableDiagnostics,
+						policy,
 					});
 				}
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, enableDiagnostics);
+				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, enableDiagnostics, policy);
 			} else {
 				// Created paths must exist before their first `didOpen`. tsserver also
 				// needs an acknowledged project reload: on delayed filesystem watchers
@@ -496,15 +541,15 @@ async function runLspWritethrough(
 				if (changeType === FileChangeType.Created) {
 					await commitWrite();
 					await notifyWriteCommitted(operationSignal);
-					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal);
+					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal, { policy });
 				}
 
 				// 1. Sync original content to LSP servers
-				await syncFileContent(dst, content, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, content, cwd, lspServers, operationSignal, true, policy);
 
 				// 2. Format in-memory via LSP
 				if (enableFormat) {
-					const formatted = await formatContent(dst, content, cwd, lspServers, operationSignal);
+					const formatted = await formatContent(dst, content, cwd, lspServers, operationSignal, policy);
 					finalContent = formatted.content;
 					if (formatted.failed) {
 						formatter = FileFormatResult.FAILED;
@@ -517,7 +562,7 @@ async function runLspWritethrough(
 
 				// 3. If formatted, sync formatted content to LSP servers
 				if (finalContent !== content) {
-					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, true, policy);
 				}
 
 				// 4. Write to disk. A formatter-altered body is the only thing left to
@@ -527,16 +572,16 @@ async function runLspWritethrough(
 			}
 
 			if (enableDiagnostics) {
-				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, operationSignal);
+				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, operationSignal, policy);
 			}
 
 			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal, !useCustomFormatter || enableDiagnostics);
+			await notifyFileSaved(dst, cwd, lspServers, operationSignal, !useCustomFormatter || enableDiagnostics, policy);
 		});
 		synced = true;
 	} catch {
 		if (timedOut) {
-			formatter = undefined;
+			formatter = formatDenied ? FileFormatResult.FAILED : undefined;
 			diagnostics = undefined;
 			// Schedule background diagnostic fetch if caller wants deferred results
 			if (deferred && !deferred.signal.aborted && enableDiagnostics) {
@@ -544,6 +589,7 @@ async function runLspWritethrough(
 					dst,
 					cwd,
 					servers,
+					policy,
 					minVersions,
 					expectedDocumentVersions,
 					waitMs: options.deferredWaitMs,
@@ -566,6 +612,7 @@ async function runLspWritethrough(
 			dst,
 			cwd,
 			servers,
+			policy,
 			minVersions,
 			expectedDocumentVersions,
 			transformDiagnostics: options.transformDiagnostics,
@@ -649,6 +696,7 @@ async function flushWritethroughBatch(
 /** Create a writethrough callback for LSP aware write operations */
 export function createLspWritethrough(cwd: string, options?: WritethroughOptions): WritethroughCallback {
 	const resolvedOptions: ResolvedWritethroughOptions = {
+		policy: options?.policy,
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 		transformDiagnostics: options?.transformDiagnostics,

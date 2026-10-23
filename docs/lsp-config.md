@@ -44,6 +44,19 @@ The native user config directory follows `PI_CONFIG_DIR` and active profiles; `~
 
 Config is cached per cwd. After changing LSP files, root markers, or installed binaries, call the `lsp` tool with `action: "reload", file: "*"` (or omit `file`) to reread config and shut down clients whose configuration is no longer current.
 
+## Extension effect policy
+
+Extensions can register blocking `lsp_before_execute` and `lsp_before_edit` handlers. Both return `{ block: true, reason?: string }` to refuse an effect. A thrown handler, handler timeout, or cancelled request refuses the effect too; no handler means no additional restriction.
+
+- `lsp_before_execute` receives `purpose` (`server`, `linter`, or `workspace_check`), the absolute executable `command`, exact `args`, and absolute `cwd` before a process starts. This includes warmup, background diagnostics, formatter/linter processes, and workspace checkers.
+- `lsp_before_edit` receives `origin` (`server_request`, `rename`, `code_action`, `file_rename`, or `format`), absolute `cwd`, and a conservative list of planned `changes`. Changes describe edits, creates, renames, and deletes with absolute paths. Invalid/non-file URIs are refused in protected scopes. The gate runs before the first workspace write using the existing edit planner.
+
+A session with either handler gets private policy-scoped clients and linter caches; it cannot borrow another session's server or its apply-edit authority. Protected sessions bypass lspmux probes and shared transports. Reload and disposal clean up only their own policy scope, and a late callback after disposal fails closed. Sessions without these handlers retain ordinary shared-client behavior. Extensions that require policy in subagents must load their handlers in those child sessions as well.
+
+A denied server `workspace/applyEdit` replies with `applied: false` and does not write files. If format-on-write is denied, the tool writes only its already-admitted original content, unformatted, and reports formatting as failed. A denied launch can be retried after policy changes; policy refusals are not initialization failures.
+
+These events are effect admission, not an operating-system sandbox. Paths are lexical absolute paths; extensions requiring symlink containment must resolve them. Language servers may write to disk internally, including while handling `workspace/executeCommand`; those writes cannot be individually intercepted. Approving the server launch together with the existing `tool_call` boundary owns that trust.
+
 ## File shape
 
 Both JSON and YAML are accepted. The top-level object can use either a `servers` wrapper key or a flat map directly:

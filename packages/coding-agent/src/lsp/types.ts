@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import type { LspBeforeEditEvent, LspBeforeExecuteEvent } from "../extensibility/extensions/types";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
@@ -313,7 +314,14 @@ export interface LinterClient {
 }
 
 /** Factory function to create a LinterClient */
-export type LinterClientFactory = (config: ServerConfig, cwd: string) => LinterClient;
+export type LinterClientFactory = (config: ServerConfig, cwd: string, policy?: LspPolicy) => LinterClient;
+
+/** Session-local authority for LSP process execution and filesystem changes. */
+export interface LspPolicy {
+	readonly scope: string;
+	beforeExecute(req: Omit<LspBeforeExecuteEvent, "type">, signal?: AbortSignal): Promise<void>;
+	beforeEdit(req: Omit<LspBeforeEditEvent, "type">, signal?: AbortSignal): Promise<void>;
+}
 
 // =============================================================================
 // Server Configuration
@@ -428,6 +436,9 @@ export interface LspServerCapabilities {
 
 export interface LspClient {
 	name: string;
+	/** Unscoped process/configuration identity. */
+	identity?: string;
+	policy?: LspPolicy;
 	cwd: string;
 	config: ServerConfig;
 	proc: LspTransport;

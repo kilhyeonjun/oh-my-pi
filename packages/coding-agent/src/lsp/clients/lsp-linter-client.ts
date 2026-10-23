@@ -6,7 +6,7 @@ import { untilAborted } from "@oh-my-pi/pi-utils";
 import { getOrCreateClient, notifySaved, sendRequest, syncContent } from "../../lsp/client";
 import { applyTextEditsToString } from "../../lsp/edits";
 import { resolveFormatOptions } from "../../lsp/format-options";
-import type { Diagnostic, LinterClient, LspClient, ServerConfig, TextEdit } from "../../lsp/types";
+import type { Diagnostic, LinterClient, LspClient, LspPolicy, ServerConfig, TextEdit } from "../../lsp/types";
 import { fileToUri } from "../../lsp/utils";
 
 /**
@@ -17,18 +17,19 @@ export class LspLinterClient implements LinterClient {
 	#client: LspClient | null = null;
 
 	/** Factory method for creating LspLinterClient instances */
-	static create(config: ServerConfig, cwd: string): LinterClient {
-		return new LspLinterClient(config, cwd);
+	static create(config: ServerConfig, cwd: string, policy?: LspPolicy): LinterClient {
+		return new LspLinterClient(config, cwd, policy);
 	}
 
 	constructor(
 		private readonly config: ServerConfig,
 		private readonly cwd: string,
+		private readonly policy?: LspPolicy,
 	) {}
 
 	async #getClient(signal?: AbortSignal): Promise<LspClient> {
 		if (!this.#client) {
-			this.#client = await getOrCreateClient(this.config, this.cwd, undefined, signal);
+			this.#client = await getOrCreateClient(this.config, this.cwd, undefined, signal, this.policy);
 		}
 		return this.#client;
 	}

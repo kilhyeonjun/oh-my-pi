@@ -2,12 +2,14 @@ import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
-import { getConfig } from "./config";
-import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
+import { clearScopedLinterClients } from "./clients";
+import { getConfig, resolveCommand } from "./config";
+import { applyWorkspaceEdit, describeWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
 import { connectSharedLspTransport } from "./mux/daemon";
 import type {
 	LspClient,
+	LspPolicy,
 	LspJsonRpcId,
 	LspJsonRpcNotification,
 	LspJsonRpcRequest,
@@ -30,6 +32,7 @@ interface PendingClient {
 	cwd: string;
 	config: ServerConfig;
 	token: symbol;
+	policy?: LspPolicy;
 }
 const clientLocks = new Map<string, PendingClient>();
 const invalidatedClientKeys = new Set<string>();
@@ -569,7 +572,7 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	}
 
 	try {
-		await applyWorkspaceEditWithLsp(params.edit, client.cwd);
+		await applyWorkspaceEditWithLsp(params.edit, client.cwd, undefined, client.policy, "server_request");
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
 		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
@@ -660,7 +663,13 @@ export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
+	origin: Parameters<LspPolicy["beforeEdit"]>[0]["origin"] = "code_action",
 ): Promise<string[]> {
+	if (policy) {
+		await policy.beforeEdit({ origin, cwd: path.resolve(cwd), changes: describeWorkspaceEdit(edit) }, signal);
+		throwIfAborted(signal);
+	}
 	const executed: ExecutedWorkspaceChange[] = [];
 	let applied: string[];
 	try {
@@ -902,7 +911,11 @@ const EXIT_TIMEOUT_MS = 1_000;
  * differently still share, while the same name resolving to different binaries
  * does not. JSON-encoded so no value can forge the separator.
  */
-function clientKey(config: ServerConfig, cwd: string): string {
+function scopedKey(identity: string, policy?: LspPolicy): string {
+	return policy ? `${identity}\0${policy.scope}` : identity;
+}
+
+function clientKey(config: ServerConfig, cwd: string, policy?: LspPolicy): string {
 	const spawnCommand = config.resolvedCommand ?? config.command;
 	const identity = stableStringifyJson([
 		config.args ?? [],
@@ -910,7 +923,7 @@ function clientKey(config: ServerConfig, cwd: string): string {
 		config.settings ?? null,
 		config.languageId ?? null,
 	]);
-	return `${spawnCommand}:${cwd}:${identity}`;
+	return scopedKey(`${spawnCommand}:${cwd}:${identity}`, policy);
 }
 
 /**
@@ -926,10 +939,13 @@ export function shutdownStaleClients(
 	cwd: string,
 	configs: readonly ServerConfig[],
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<string[]> {
 	const fresh = new Set(configs.map(config => clientKey(config, cwd)));
 	const resolvedCwd = path.resolve(cwd);
-	const previousBarrier = clientReloadBarriers.get(resolvedCwd);
+	const barrierKey = scopedKey(resolvedCwd, policy);
+	const sameScope = (candidate?: LspPolicy) => candidate?.scope === policy?.scope;
+	const previousBarrier = clientReloadBarriers.get(barrierKey);
 	const cleanup = (async (): Promise<string[]> => {
 		if (previousBarrier) {
 			try {
@@ -940,16 +956,23 @@ export function shutdownStaleClients(
 				// failed; ordinary client creation remains blocked in between.
 			}
 		}
-		for (const key of fresh) invalidatedClientKeys.delete(key);
+		for (const identity of fresh) invalidatedClientKeys.delete(scopedKey(identity, policy));
 		// Tombstone stale identities before awaiting initialization. Existing
 		// callers keep sharing their in-flight promise; later callers cannot spawn
 		// another stale process while reload is blocked on teardown.
 		const stalePending = Array.from(clientLocks.entries()).filter(
-			([key, pending]) => path.resolve(pending.cwd) === resolvedCwd && !fresh.has(key),
+			([, pending]) =>
+				path.resolve(pending.cwd) === resolvedCwd &&
+				sameScope(pending.policy) &&
+				!fresh.has(clientKey(pending.config, pending.cwd)),
 		);
 		for (const [key] of stalePending) invalidatedClientKeys.add(key);
 		for (const client of clients.values()) {
-			if (path.resolve(client.cwd) === resolvedCwd && !fresh.has(client.name)) {
+			if (
+				path.resolve(client.cwd) === resolvedCwd &&
+				sameScope(client.policy) &&
+				!fresh.has(client.identity ?? client.name)
+			) {
 				invalidatedClientKeys.add(client.name);
 			}
 		}
@@ -964,7 +987,10 @@ export function shutdownStaleClients(
 		);
 
 		const stale = Array.from(clients.values()).filter(
-			client => path.resolve(client.cwd) === resolvedCwd && !fresh.has(client.name),
+			client =>
+				path.resolve(client.cwd) === resolvedCwd &&
+				sameScope(client.policy) &&
+				!fresh.has(client.identity ?? client.name),
 		);
 		const results = await Promise.all(stale.map(client => shutdownClientInstance(client)));
 		const failed = stale.filter((_client, index) => results[index] !== true);
@@ -976,19 +1002,43 @@ export function shutdownStaleClients(
 		}
 		return stale.map(client => client.config.command);
 	})();
-	clientReloadBarriers.set(resolvedCwd, cleanup);
+	clientReloadBarriers.set(barrierKey, cleanup);
 	void cleanup.then(
 		() => {
-			if (clientReloadBarriers.get(resolvedCwd) === cleanup) clientReloadBarriers.delete(resolvedCwd);
+			if (clientReloadBarriers.get(barrierKey) === cleanup) clientReloadBarriers.delete(barrierKey);
 		},
 		() => {},
 	);
 	return cleanup;
 }
 
+/** Stop only clients owned by a disposed policy scope, including pending startups. */
+export async function shutdownScopedClients(scope: string): Promise<void> {
+	try {
+		const pending = Array.from(clientLocks.entries()).filter(([, entry]) => entry.policy?.scope === scope);
+		for (const [key] of pending) invalidatedClientKeys.add(key);
+		await Promise.all(
+			pending.map(async ([, entry]) => {
+				try {
+					await entry.promise;
+				} catch {
+					/* Rejected initialization has already cleaned up. */
+				}
+			}),
+		);
+		await Promise.all(
+			Array.from(clients.values())
+				.filter(client => client.policy?.scope === scope)
+				.map(client => shutdownClientInstance(client)),
+		);
+	} finally {
+		clearScopedLinterClients(scope);
+	}
+}
+
 /** Allow an explicit user reload to retry a matching initialization failure immediately. */
-export function clearInitializationFailure(config: ServerConfig, cwd: string): void {
-	initFailures.delete(clientKey(config, cwd));
+export function clearInitializationFailure(config: ServerConfig, cwd: string, policy?: LspPolicy): void {
+	initFailures.delete(clientKey(config, cwd, policy));
 }
 
 /**
@@ -1006,8 +1056,9 @@ export async function getOrCreateClient(
 	cwd: string,
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<LspClient> {
-	const key = clientKey(config, cwd);
+	const key = clientKey(config, cwd, policy);
 	// Check if client already exists
 	const existingClient = clients.get(key);
 	if (existingClient && !invalidatedClientKeys.has(key)) {
@@ -1026,7 +1077,7 @@ export async function getOrCreateClient(
 	}
 
 	// Do not start a fresh identity until superseded processes are confirmed stopped.
-	const reloadBarrier = clientReloadBarriers.get(path.resolve(cwd));
+	const reloadBarrier = clientReloadBarriers.get(scopedKey(path.resolve(cwd), policy));
 	if (reloadBarrier) {
 		try {
 			await untilAborted(signal, reloadBarrier);
@@ -1060,22 +1111,38 @@ export async function getOrCreateClient(
 	// Create new client with lock
 	const lockToken = Symbol();
 	const clientPromise = (async () => {
-		const baseCommand = config.resolvedCommand ?? config.command;
+		const configuredCommand = config.resolvedCommand ?? config.command;
+		const baseCommand = policy
+			? path.isAbsolute(configuredCommand)
+				? configuredCommand
+				: resolveCommand(configuredCommand, cwd)
+			: configuredCommand;
+		if (!baseCommand || (policy && !path.isAbsolute(baseCommand))) {
+			throw new Error(`Cannot resolve absolute LSP command: ${configuredCommand}`);
+		}
 		const baseArgs = config.args ?? [];
+		if (policy) {
+			await policy.beforeExecute(
+				{ purpose: "server", command: baseCommand, args: [...baseArgs], cwd: path.resolve(cwd) },
+				signal,
+			);
+			throwIfAborted(signal);
+		}
 		// Sent in both the mux handshake and `initialize`: a reused shared server
 		// answers `initialize` from cache, so the mux keys servers on these options.
 		const initializationOptions = config.initOptions ?? {};
 
 		// Wrap with lspmux if available and supported
-		const { command, args, env } = isLspmuxSupported(baseCommand)
-			? await getLspmuxCommand(baseCommand, baseArgs)
-			: { command: baseCommand, args: baseArgs };
+		const { command, args, env } =
+			!policy && isLspmuxSupported(baseCommand)
+				? await getLspmuxCommand(baseCommand, baseArgs)
+				: { command: baseCommand, args: baseArgs };
 
 		// Prefer the broker-shared server unless an external lspmux wrapper is
 		// already multiplexing this command. Any shared-path failure falls back
 		// to a private spawn so LSP never regresses on broker trouble.
 		let proc: LspTransport | null = null;
-		if (sharedLspEnabled && command === baseCommand) {
+		if (!policy && sharedLspEnabled && command === baseCommand) {
 			proc = await connectSharedLspTransport({ command, args, cwd, env, initializationOptions, signal });
 		}
 		proc ??= ptree.spawn([command, ...args], {
@@ -1098,6 +1165,8 @@ export async function getOrCreateClient(
 
 		const client: LspClient = {
 			name: key,
+			identity: clientKey(config, cwd),
+			policy,
 			cwd,
 			proc,
 			config,
@@ -1210,8 +1279,13 @@ export async function getOrCreateClient(
 		}
 	})();
 
-	clientLocks.set(key, { promise: clientPromise, cwd, config, token: lockToken });
-	return clientPromise;
+	clientLocks.set(key, { promise: clientPromise, cwd, config, token: lockToken, policy });
+	try {
+		return await clientPromise;
+	} finally {
+		// Includes authorization, command resolution and spawn failures before initialization.
+		if (clientLocks.get(key)?.token === lockToken) clientLocks.delete(key);
+	}
 }
 
 /** Return an active or already-starting client without starting a language server. */
@@ -1219,15 +1293,16 @@ export async function getActiveOrPendingClient(
 	config: ServerConfig,
 	cwd: string,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<LspClient | undefined> {
 	throwIfAborted(signal);
-	const client = clients.get(clientKey(config, cwd));
+	const client = clients.get(clientKey(config, cwd, policy));
 	if (client) {
 		client.lastActivity = Date.now();
 		return client;
 	}
 
-	const pending = clientLocks.get(clientKey(config, cwd));
+	const pending = clientLocks.get(clientKey(config, cwd, policy));
 	if (!pending) return undefined;
 	try {
 		return await untilAborted(signal, pending.promise);
@@ -1935,12 +2010,14 @@ export interface LspServerStatus {
 /**
  * Get status of all active LSP clients.
  */
-export function getActiveClients(): LspServerStatus[] {
-	return Array.from(clients.values()).map(client => ({
-		name: client.config.command,
-		status: client.status,
-		fileTypes: client.config.fileTypes,
-	}));
+export function getActiveClients(policy?: LspPolicy): LspServerStatus[] {
+	return Array.from(clients.values())
+		.filter(client => !policy || client.policy?.scope === policy.scope)
+		.map(client => ({
+			name: client.config.command,
+			status: client.status,
+			fileTypes: client.config.fileTypes,
+		}));
 }
 
 // =============================================================================

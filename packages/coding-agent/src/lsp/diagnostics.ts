@@ -15,6 +15,7 @@ import type {
 	Location,
 	LocationLink,
 	LspClient,
+	LspPolicy,
 	Position,
 	PublishedDiagnostics,
 	ServerConfig,
@@ -359,6 +360,7 @@ export async function waitForDiagnostics(
 export type ServerVersionMap = Map<string, number>;
 
 interface GetDiagnosticsForFileOptions {
+	policy?: LspPolicy;
 	signal?: AbortSignal;
 	minVersions?: ServerVersionMap;
 	expectedDocumentVersions?: ServerVersionMap;
@@ -381,12 +383,13 @@ export async function captureDiagnosticVersions(
 	servers: Array<[string, ServerConfig]>,
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<ServerVersionMap> {
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
 			if (serverConfig.createClient) return;
-			const client = await getOrCreateClient(serverConfig, cwd, initTimeoutMs, signal);
+			const client = await getOrCreateClient(serverConfig, cwd, initTimeoutMs, signal, policy);
 			versions.set(serverName, client.diagnosticsVersion);
 		}),
 	);
@@ -398,12 +401,13 @@ export async function captureOpenFileVersions(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<ServerVersionMap> {
 	const uri = fileToUri(absolutePath);
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal, policy);
 			const version = client.openFiles.get(uri)?.version;
 			if (version !== undefined) {
 				versions.set(serverName, version);
@@ -428,7 +432,7 @@ export async function getDiagnosticsForFile(
 	servers: Array<[string, ServerConfig]>,
 	options: GetDiagnosticsForFileOptions = {},
 ): Promise<FileDiagnosticsResult | undefined> {
-	const { signal, minVersions, expectedDocumentVersions, timeoutMs } = options;
+	const { signal, minVersions, expectedDocumentVersions, timeoutMs, policy } = options;
 	if (servers.length === 0) {
 		return undefined;
 	}
@@ -456,13 +460,13 @@ export async function getDiagnosticsForFile(
 				throwIfAborted(boundSignal);
 				// Use custom linter client if configured
 				if (serverConfig.createClient) {
-					const linterClient = getLinterClient(serverName, serverConfig, cwd);
+					const linterClient = getLinterClient(serverName, serverConfig, cwd, policy);
 					const diagnostics = await linterClient.lint(absolutePath, boundSignal);
 					return { serverName, serverConfig, diagnostics };
 				}
 
 				// Default: use LSP
-				const client = await getOrCreateClient(serverConfig, cwd, undefined, boundSignal);
+				const client = await getOrCreateClient(serverConfig, cwd, undefined, boundSignal, policy);
 				throwIfAborted(boundSignal);
 				if (isProjectAwareLspServer(serverConfig)) {
 					await waitForProjectLoaded(client, boundSignal);
@@ -559,6 +563,7 @@ export async function formatContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<FormatContentResult> {
 	if (servers.length === 0) {
 		// No formatters configured at all
@@ -584,14 +589,14 @@ export async function formatContent(
 			throwIfAborted(signal);
 			// Use custom linter client if configured
 			if (serverConfig.createClient) {
-				const linterClient = getLinterClient(serverName, serverConfig, cwd);
+				const linterClient = getLinterClient(serverName, serverConfig, cwd, policy);
 				const formattedContent = await linterClient.format(absolutePath, content);
 				return { content: formattedContent, failed: false, unsupported: false };
 			}
 
 			// Default: use LSP. Initialization failures are formatter failures;
 			// a successfully initialized server without formatting support is unsupported.
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal, policy);
 			throwIfAborted(signal);
 
 			const caps = client.serverCapabilities;

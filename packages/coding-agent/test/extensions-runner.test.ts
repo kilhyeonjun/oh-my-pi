@@ -96,6 +96,88 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	for (const eventType of ["lsp_before_execute", "lsp_before_edit"] as const) {
+		describe(eventType, () => {
+			const makeGate = async (body?: string) => {
+				if (body) {
+					fs.writeFileSync(
+						path.join(extensionsDir, "lsp-policy.ts"),
+						`export default api => {
+						api.on(${JSON.stringify(eventType)}, ${body});
+					}`,
+					);
+				}
+				const loaded = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					loaded.extensions,
+					loaded.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const emit = (signal?: AbortSignal) =>
+					eventType === "lsp_before_execute"
+						? runner.emitLspBeforeExecute(
+								{ type: eventType, purpose: "server", command: "/bin/server", args: [], cwd: tempDir.path() },
+								signal,
+							)
+						: runner.emitLspBeforeEdit(
+								{ type: eventType, origin: "rename", changes: [], cwd: tempDir.path() },
+								signal,
+							);
+				return { extensions: loaded.extensions, emit };
+			};
+
+			it("allows effects without handlers", async () => {
+				const { emit } = await makeGate();
+				expect(await emit()).toBeUndefined();
+			});
+
+			it("returns the first block without consulting later handlers", async () => {
+				const { extensions, emit } = await makeGate(`() => ({ block: true, reason: "denied" })`);
+				const later = vi.fn(() => {
+					throw new Error("must not run");
+				});
+				extensions[0]!.handlers.get(eventType)!.push(later);
+				expect(await emit()).toEqual({ block: true, reason: "denied" });
+				expect(later).not.toHaveBeenCalled();
+			});
+
+			it("fails closed when a handler throws", async () => {
+				const { emit } = await makeGate(`() => { throw new Error("policy unavailable"); }`);
+				expect(await emit()).toMatchObject({ block: true, reason: expect.stringContaining("policy unavailable") });
+			});
+
+			it("fails closed on timeout", async () => {
+				const { emit } = await makeGate(`() => Promise.withResolvers().promise`);
+				testSetExtensionHandlerTimeoutMs(10);
+				vi.useFakeTimers();
+				try {
+					const decision = emit();
+					vi.advanceTimersByTime(10);
+					await Promise.resolve();
+					await Promise.resolve();
+					vi.advanceTimersByTime(0);
+					expect(await decision).toMatchObject({
+						block: true,
+						reason: expect.stringContaining("timed out after 10ms"),
+					});
+				} finally {
+					vi.useRealTimers();
+				}
+			});
+
+			it("fails closed when cancelled before or during a handler", async () => {
+				const { emit } = await makeGate(`() => Promise.withResolvers().promise`);
+				const controller = new AbortController();
+				const pending = emit(controller.signal);
+				controller.abort();
+				expect(await pending).toMatchObject({ block: true });
+				expect(await emit(controller.signal)).toMatchObject({ block: true });
+			});
+		});
+	}
+
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
 		const dirB = tempDir.join("dirB");

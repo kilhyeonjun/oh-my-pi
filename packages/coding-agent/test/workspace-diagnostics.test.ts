@@ -1,4 +1,5 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import type { LspPolicy } from "../src/lsp/types";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +8,7 @@ import {
 	combineProjectDescriptions,
 	detectProjectTypes,
 	interpretEmptyDiagnosticsResult,
+	runWorkspaceDiagnostics,
 } from "../src/lsp/workspace-diagnostics";
 
 const command = ["npx", "tsc", "--noEmit"];
@@ -99,6 +101,74 @@ describe("detectProjectTypes", () => {
 		expect(detected[0]?.type).toBe("unknown");
 		expect(detected[0]?.command).toBeUndefined();
 	});
+});
+
+describe("workspace checker policy", () => {
+	test("spawns each approved Go phase with exactly the authorized absolute argv", async () => {
+		const root = makeRoot("go.work");
+		const executable = path.join(root, "bin/go");
+		fs.mkdirSync(path.dirname(executable), { recursive: true });
+		fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		const requests: Parameters<LspPolicy["beforeExecute"]>[0][] = [];
+		const policy: LspPolicy = {
+			scope: "workspace-allow",
+			async beforeExecute(request) {
+				requests.push(request);
+			},
+			async beforeEdit() {},
+		};
+		const spawn = spyOn(Bun, "spawn");
+		try {
+			const result = await runWorkspaceDiagnostics(root, undefined, policy);
+			expect(result.output).toBe("No issues found");
+			expect(requests.map(request => request.args)).toEqual([
+				["work", "edit", "-json"],
+				["build", "./..."],
+			]);
+			expect(spawn).toHaveBeenCalledTimes(2);
+			for (const [index, request] of requests.entries()) {
+				expect(request.command).toBe(executable);
+				expect(request.cwd).toBe(root);
+				expect(spawn.mock.calls[index]?.[0]).toEqual([request.command, ...request.args]);
+			}
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
+	for (const workspace of [false, true]) {
+		test(`blocks ${workspace ? "Go workspace discovery" : "TypeScript checker"} before spawning`, async () => {
+			const root = makeRoot(...(workspace ? ["go.work"] : ["tsconfig.json", "package.json"]));
+			const executable = path.join(root, workspace ? "bin/go" : "node_modules/.bin/npx");
+			fs.mkdirSync(path.dirname(executable), { recursive: true });
+			fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+			const requests: Parameters<LspPolicy["beforeExecute"]>[0][] = [];
+			const policy: LspPolicy = {
+				scope: "workspace-denial",
+				async beforeExecute(request) {
+					requests.push(request);
+					throw new Error("checker denied");
+				},
+				async beforeEdit() {},
+			};
+			const spawn = spyOn(Bun, "spawn");
+			try {
+				const result = await runWorkspaceDiagnostics(root, undefined, policy);
+				expect(result.output).toContain("checker denied");
+				expect(spawn).not.toHaveBeenCalled();
+				expect(requests).toEqual([
+					{
+						purpose: "workspace_check",
+						command: executable,
+						args: workspace ? ["work", "edit", "-json"] : ["tsc", "--noEmit"],
+						cwd: root,
+					},
+				]);
+			} finally {
+				spawn.mockRestore();
+			}
+		});
+	}
 });
 
 describe("combineProjectDescriptions", () => {

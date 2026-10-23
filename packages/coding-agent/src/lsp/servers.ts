@@ -16,7 +16,7 @@ import {
 } from "./client";
 import { getServersForFile, type LspConfig, loadConfig } from "./config";
 import { MUX_RESTART_METHOD } from "./mux/protocol";
-import type { LspClient, ServerConfig } from "./types";
+import type { LspClient, LspPolicy, ServerConfig } from "./types";
 import { uriToFile } from "./utils";
 
 /**
@@ -50,6 +50,7 @@ export interface LspWarmupResult {
 
 /** Options for warming up LSP servers */
 export interface LspWarmupOptions {
+	policy?: LspPolicy;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
 }
@@ -88,7 +89,13 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 	// Servers that don't respond quickly will be initialized lazily on first use
 	const results = await Promise.allSettled(
 		lspServers.map(async ([name, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd, serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS);
+			const client = await getOrCreateClient(
+				serverConfig,
+				cwd,
+				serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS,
+				undefined,
+				options?.policy,
+			);
 			return { name, client, fileTypes: serverConfig.fileTypes };
 		}),
 	);
@@ -140,6 +147,7 @@ export async function syncFileContent(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 	createMissing = true,
+	policy?: LspPolicy,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -149,8 +157,8 @@ export async function syncFileContent(
 				return;
 			}
 			const client = createMissing
-				? await getOrCreateClient(serverConfig, cwd, undefined, signal)
-				: await getActiveOrPendingClient(serverConfig, cwd, signal);
+				? await getOrCreateClient(serverConfig, cwd, undefined, signal, policy)
+				: await getActiveOrPendingClient(serverConfig, cwd, signal, policy);
 			if (!client) return;
 			throwIfAborted(signal);
 			await syncContent(client, absolutePath, content, signal);
@@ -173,6 +181,7 @@ export async function notifyFileSaved(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 	createMissing = true,
+	policy?: LspPolicy,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -182,8 +191,8 @@ export async function notifyFileSaved(
 				return;
 			}
 			const client = createMissing
-				? await getOrCreateClient(serverConfig, cwd, undefined, signal)
-				: await getActiveOrPendingClient(serverConfig, cwd, signal);
+				? await getOrCreateClient(serverConfig, cwd, undefined, signal, policy)
+				: await getActiveOrPendingClient(serverConfig, cwd, signal, policy);
 			if (!client) return;
 			await notifySaved(client, absolutePath, signal);
 		}),

@@ -2,7 +2,9 @@
  * SwiftLint CLI-based linter client.
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
-import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import * as path from "node:path";
+import { resolveCommand } from "../../lsp/config";
+import type { Diagnostic, DiagnosticSeverity, LinterClient, LspPolicy, ServerConfig } from "../../lsp/types";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
 interface SwiftLintViolation {
@@ -31,8 +33,17 @@ async function runSwiftLint(
 	cwd: string,
 	resolvedCommand?: string,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<{ stdout: string; stderr: string; success: boolean }> {
-	const command = resolvedCommand ?? "swiftlint";
+	const configuredCommand = resolvedCommand ?? "swiftlint";
+	const command =
+		policy && !path.isAbsolute(configuredCommand) ? resolveCommand(configuredCommand, cwd) : configuredCommand;
+	if (!command || (policy && !path.isAbsolute(command)))
+		throw new Error(`Cannot resolve absolute SwiftLint command: ${configuredCommand}`);
+	if (policy) {
+		await policy.beforeExecute({ purpose: "linter", command, args: [...args], cwd: path.resolve(cwd) }, signal);
+		signal?.throwIfAborted();
+	}
 
 	try {
 		const proc = Bun.spawn([command, ...args], {
@@ -61,13 +72,14 @@ async function runSwiftLint(
  */
 export class SwiftLintClient implements LinterClient {
 	/** Factory method for creating SwiftLintClient instances */
-	static create(config: ServerConfig, cwd: string): LinterClient {
-		return new SwiftLintClient(config, cwd);
+	static create(config: ServerConfig, cwd: string, policy?: LspPolicy): LinterClient {
+		return new SwiftLintClient(config, cwd, policy);
 	}
 
 	constructor(
 		private readonly config: ServerConfig,
 		private readonly cwd: string,
+		private readonly policy?: LspPolicy,
 	) {}
 
 	async format(_filePath: string, content: string): Promise<string> {
@@ -81,6 +93,7 @@ export class SwiftLintClient implements LinterClient {
 			this.cwd,
 			this.config.resolvedCommand,
 			signal,
+			this.policy,
 		);
 
 		if (!result.success) {

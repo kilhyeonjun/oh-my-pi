@@ -52,6 +52,7 @@ import {
 } from "./diagnostics";
 import {
 	applyEditsThenRename,
+	describeWorkspaceEdit,
 	flattenWorkspaceTextEdits,
 	type RenameReferenceEdit,
 	rangesOverlap,
@@ -230,11 +231,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		throwIfAborted(signal);
 
 		const config = getConfig(this.session.cwd);
+		const policy = this.session.getLspPolicy?.();
 
 		// Status action doesn't need a file
 		if (action === "status") {
 			const configuredNames = Object.keys(config.servers);
-			const lspmuxState = await detectLspmux();
+			const lspmuxState = policy ? { available: false, running: false } : await detectLspmux();
 			const lspmuxStatus = lspmuxState.available
 				? lspmuxState.running
 					? "lspmux: active (multiplexing enabled)"
@@ -247,7 +249,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// component) still appears here. Distinguish "configured" from
 			// "started" (have a live in-process client) so callers cannot mistake
 			// presence-on-PATH for a working server.
-			const startedClients = getActiveClients();
+			const startedClients = getActiveClients(policy);
 			const startedByConfigName = new Map<string, LspServerStatus>();
 			// getActiveClients() reports `name = client.config.command` (the
 			// unresolved binary name from defaults.json), so match against
@@ -283,7 +285,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		if (action === "diagnostics") {
 			if (file === "*") {
 				// `*` => run workspace diagnostics across all configured servers
-				const result = await runWorkspaceDiagnostics(this.session.cwd, signal);
+				const result = await runWorkspaceDiagnostics(this.session.cwd, signal, policy);
 				return {
 					content: [
 						{
@@ -352,14 +354,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					try {
 						throwIfAborted(signal);
 						if (serverConfig.createClient) {
-							const linterClient = getLinterClient(serverName, serverConfig, this.session.cwd);
+							const linterClient = getLinterClient(serverName, serverConfig, this.session.cwd, policy);
 							const diagnostics = await linterClient.lint(resolved, signal);
 							allDiagnostics.push(...diagnostics);
 							succeededServers++;
 							totalServerSuccesses++;
 							continue;
 						}
-						const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+						const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal, policy);
 						if (isProjectAwareLspServer(serverConfig)) {
 							await waitForProjectLoaded(client, signal);
 							throwIfAborted(signal);
@@ -607,7 +609,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				throwIfAborted(signal);
 				let client: LspClient;
 				try {
-					client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal, policy);
 					if (isProjectAwareLspServer(serverConfig)) {
 						await waitForProjectLoaded(client, signal);
 					}
@@ -794,12 +796,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// Apply the reference edits and move as one unit: a failed move rolls
 			// the reference edits back so the source, destination, and every
 			// reference file are left unchanged.
+			if (policy) {
+				const changes = describeWorkspaceEdit({
+					changes: Object.fromEntries(Array.from(acceptedByUri, ([uri, bucket]) => [uri, bucket.edits])),
+				});
+				if (!path.isAbsolute(source) || !path.isAbsolute(dest)) {
+					throw new ToolError("LSP file rename requires absolute paths");
+				}
+				changes.push({ kind: "rename", oldPath: source, newPath: dest, overwrite: false });
+				await policy.beforeEdit({ origin: "file_rename", cwd: path.resolve(this.session.cwd), changes }, signal);
+				throwIfAborted(signal);
+			}
 			await applyEditsThenRename(referenceEdits, source, dest);
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
 			for (const [serverName, serverConfig] of servers) {
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal, policy);
 					for (const { oldUri } of pairs) {
 						if (client.openFiles.has(oldUri)) {
 							await sendNotification(client, "textDocument/didClose", { textDocument: { uri: oldUri } }, signal);
@@ -860,7 +873,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of serverList) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal, policy);
 					respondingServers.add(serverName);
 					const caps = client.serverCapabilities ?? {};
 					sections.push(`${serverName}:`);
@@ -946,7 +959,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 
 			try {
-				const client = await getOrCreateClient(chosenConfig, this.session.cwd, undefined, signal);
+				const client = await getOrCreateClient(chosenConfig, this.session.cwd, undefined, signal, policy);
 				if (resolvedTarget) {
 					await reconcileFileFromDisk(client, resolvedTarget, signal);
 				}
@@ -1023,6 +1036,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
+						policy,
 					);
 					const workspaceResult = (await sendRequest(
 						workspaceClient,
@@ -1120,6 +1134,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				this.session.cwd,
 				servers.map(([, serverConfig]) => serverConfig),
 				signal,
+				policy,
 			);
 			if (servers.length === 0) {
 				return {
@@ -1133,13 +1148,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
-				clearInitializationFailure(workspaceServerConfig, this.session.cwd);
+				clearInitializationFailure(workspaceServerConfig, this.session.cwd, policy);
 				try {
 					const workspaceClient = await getOrCreateClient(
 						workspaceServerConfig,
 						this.session.cwd,
 						undefined,
 						signal,
+						policy,
 					);
 					outputs.push(await reloadServer(workspaceClient, workspaceServerName, signal));
 				} catch (err) {
@@ -1166,10 +1182,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 		const [serverName, serverConfig] = serverInfo;
 
-		if (action === "reload") clearInitializationFailure(serverConfig, this.session.cwd);
+		if (action === "reload") clearInitializationFailure(serverConfig, this.session.cwd, policy);
 
 		try {
-			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal, policy);
 			const targetFile = resolvedFile;
 			const isRustAnalyzerServer = isRustAnalyzerClient(client) || serverName === "rust-analyzer";
 			const needsProjectIndex =
@@ -1432,7 +1448,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEditWithLsp(edit, this.session.cwd, signal),
+							applyWorkspaceEdit: async edit =>
+								applyWorkspaceEditWithLsp(edit, this.session.cwd, signal, policy, "code_action"),
 							executeCommand: async commandItem => {
 								await sendRequest(
 									client,
@@ -1537,7 +1554,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							const applied = await applyWorkspaceEditWithLsp(result, this.session.cwd, signal);
+							const applied = await applyWorkspaceEditWithLsp(
+								result,
+								this.session.cwd,
+								signal,
+								policy,
+								"rename",
+							);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
 							const preview = formatWorkspaceEdit(result, this.session.cwd);

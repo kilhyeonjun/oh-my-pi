@@ -181,6 +181,7 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const deduplicate = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(session.settings);
 	return enableLsp
 		? createLspWritethrough(session.cwd, {
+				policy: session.getLspPolicy?.(),
 				enableFormat,
 				enableDiagnostics,
 				transformDiagnostics: deduplicate

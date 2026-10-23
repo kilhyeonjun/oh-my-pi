@@ -81,6 +81,9 @@ import type {
 	CacheWarmingAction,
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,
+	LspBeforeEditEvent,
+	LspBeforeEffectEventResult,
+	LspBeforeExecuteEvent,
 	McpNotificationEvent,
 	MessageRenderer,
 	RegisteredCommand,
@@ -393,6 +396,8 @@ type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
 	| ToolResultEvent
+	| LspBeforeExecuteEvent
+	| LspBeforeEditEvent
 	| UserBashEvent
 	| ContextEvent
 	| CacheWarmingDecisionEvent
@@ -1990,6 +1995,57 @@ export class ExtensionRunner {
 			return { block: true, reason: `Tool execution was cancelled while an extension handler was pending` };
 		}
 		return buildAggregatedToolCallResult(result, aggregated);
+	}
+
+	async emitLspBeforeExecute(
+		event: LspBeforeExecuteEvent,
+		signal?: AbortSignal,
+	): Promise<LspBeforeEffectEventResult | undefined> {
+		return this.#emitLspBeforeEffect(event, signal);
+	}
+
+	async emitLspBeforeEdit(
+		event: LspBeforeEditEvent,
+		signal?: AbortSignal,
+	): Promise<LspBeforeEffectEventResult | undefined> {
+		return this.#emitLspBeforeEffect(event, signal);
+	}
+
+	async #emitLspBeforeEffect(
+		event: LspBeforeExecuteEvent | LspBeforeEditEvent,
+		signal?: AbortSignal,
+	): Promise<LspBeforeEffectEventResult | undefined> {
+		const cancelled = (): LspBeforeEffectEventResult => ({ block: true, reason: "LSP effect was cancelled" });
+		if (signal?.aborted) return cancelled();
+		const ctx = this.createContext();
+		const timeoutMs = normalizeHandlerTimeout(
+			(this.settings ? cfgExtensionHandlersToolCallTimeoutMs.get(this.settings) : undefined) ??
+				extensionHandlerTimeoutMs,
+		);
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get(event.type);
+			if (!handlers) continue;
+			for (const handler of handlers) {
+				const result = (await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					timeoutMs,
+					(kind, message) => ({
+						block: true,
+						reason:
+							kind === "timeout"
+								? `Extension ${ext.path} timed out after ${timeoutMs}ms`
+								: `Extension ${ext.path} failed: ${message}`,
+					}),
+					signal,
+				)) as LspBeforeEffectEventResult | undefined;
+				if (result?.block) return result;
+				if (signal?.aborted) return cancelled();
+			}
+		}
+		return signal?.aborted ? cancelled() : undefined;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {

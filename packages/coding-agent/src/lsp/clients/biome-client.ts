@@ -4,7 +4,8 @@
  */
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import { resolveCommand } from "../../lsp/config";
+import type { Diagnostic, DiagnosticSeverity, LinterClient, LspPolicy, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
 // Biome JSON Output Types
@@ -62,12 +63,23 @@ async function runBiome(
 	cwd: string,
 	resolvedCommand?: string,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
+	input?: string,
 ): Promise<{ stdout: string; stderr: string; success: boolean }> {
-	const command = resolvedCommand ?? "biome";
+	const configuredCommand = resolvedCommand ?? "biome";
+	const command =
+		policy && !path.isAbsolute(configuredCommand) ? resolveCommand(configuredCommand, cwd) : configuredCommand;
+	if (!command || (policy && !path.isAbsolute(command)))
+		throw new Error(`Cannot resolve absolute Biome command: ${configuredCommand}`);
+	if (policy) {
+		await policy.beforeExecute({ purpose: "linter", command, args: [...args], cwd: path.resolve(cwd) }, signal);
+		signal?.throwIfAborted();
+	}
 
 	try {
 		const proc = Bun.spawn([command, ...args], {
 			cwd,
+			stdin: input === undefined ? undefined : new Blob([input]),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
@@ -105,21 +117,41 @@ function warnBiomeOnce(key: string, message: string, meta: Record<string, unknow
  */
 export class BiomeClient implements LinterClient {
 	/** Factory method for creating BiomeClient instances */
-	static create(config: ServerConfig, cwd: string): LinterClient {
-		return new BiomeClient(config, cwd);
+	static create(config: ServerConfig, cwd: string, policy?: LspPolicy): LinterClient {
+		return new BiomeClient(config, cwd, policy);
 	}
 
 	constructor(
 		private readonly config: ServerConfig,
 		private readonly cwd: string,
+		private readonly policy?: LspPolicy,
 	) {}
 
 	async format(filePath: string, content: string): Promise<string> {
+		if (this.policy) {
+			// Protected formatting is in-memory: the writethrough gates the eventual
+			// destination write, and a denied spawn cannot overwrite caller content.
+			const result = await runBiome(
+				["format", "--stdin-file-path", filePath],
+				this.cwd,
+				this.config.resolvedCommand,
+				undefined,
+				this.policy,
+				content,
+			);
+			return result.success ? result.stdout : content;
+		}
 		// Keep the standalone LinterClient contract: callers supply the content to
 		// format, regardless of what is currently on disk.
 		await Bun.write(filePath, content);
 
-		const result = await runBiome(["format", "--write", filePath], this.cwd, this.config.resolvedCommand);
+		const result = await runBiome(
+			["format", "--write", filePath],
+			this.cwd,
+			this.config.resolvedCommand,
+			undefined,
+			this.policy,
+		);
 
 		if (result.success) {
 			return await Bun.file(filePath).text();
@@ -136,6 +168,7 @@ export class BiomeClient implements LinterClient {
 			this.cwd,
 			this.config.resolvedCommand,
 			signal,
+			this.policy,
 		);
 
 		// Biome exits non-zero when diagnostics are found, so only an empty

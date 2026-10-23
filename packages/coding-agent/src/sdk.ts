@@ -148,7 +148,9 @@ import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal }
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
-import { setSharedLspEnabled } from "./lsp/client";
+import { setSharedLspEnabled, shutdownScopedClients } from "./lsp/client";
+import type { LspPolicy } from "./lsp/types";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
 import {
 	deduplicateMCPToolsByName,
@@ -2349,6 +2351,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// mutation (any tool) bumped it in the meantime.
 		const fileMutationVersions = new Map<string, number>();
 		const disposeCallbacks = new Set<() => void>();
+		let lspPolicy: LspPolicy | undefined;
+		let lspPolicyDisposed = false;
 		const activeToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool & Pick<ToolDefinition, "defaultInactive">>();
 		const setActiveToolNames = (names: Iterable<string>): void => {
@@ -2465,6 +2469,47 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getClientBridge: () => session?.clientBridge,
 			emitBeforeSubagentSpawn: (event, signal) =>
 				session?.extensionRunner?.emitBeforeSubagentSpawn(event, signal) ?? Promise.resolve(undefined),
+			getLspPolicy: () => {
+				if (lspPolicy) return lspPolicy;
+				const runner = session?.extensionRunner;
+				if (!runner?.hasHandlers("lsp_before_execute") && !runner?.hasHandlers("lsp_before_edit")) {
+					return undefined;
+				}
+				const scope = `lsp-session:${Snowflake.next()}`;
+				lspPolicy = {
+					scope,
+					beforeExecute: async (request, signal) => {
+						const activeRunner = session?.extensionRunner;
+						if (lspPolicyDisposed || session?.isDisposed || !activeRunner) {
+							throw new ToolError("LSP policy session is unavailable");
+						}
+						const result = await activeRunner.emitLspBeforeExecute(
+							{ ...request, type: "lsp_before_execute" },
+							signal,
+						);
+						if (lspPolicyDisposed || session?.isDisposed)
+							throw new ToolError("LSP policy session is unavailable");
+						if (result?.block) throw new ToolError(result.reason ?? "LSP execution blocked by extension");
+					},
+					beforeEdit: async (request, signal) => {
+						const activeRunner = session?.extensionRunner;
+						if (lspPolicyDisposed || session?.isDisposed || !activeRunner) {
+							throw new ToolError("LSP policy session is unavailable");
+						}
+						const result = await activeRunner.emitLspBeforeEdit({ ...request, type: "lsp_before_edit" }, signal);
+						if (lspPolicyDisposed || session?.isDisposed)
+							throw new ToolError("LSP policy session is unavailable");
+						if (result?.block) throw new ToolError(result.reason ?? "LSP edit blocked by extension");
+					},
+				};
+				toolSession.registerDisposeCallback?.(() => {
+					lspPolicyDisposed = true;
+					void shutdownScopedClients(scope).catch(error => {
+						logger.warn("Failed to shut down session LSP clients", { error: String(error) });
+					});
+				});
+				return lspPolicy;
+			},
 			queueDeferredDiagnostics: entry => session?.yieldQueue.enqueue(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, entry),
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
@@ -5318,7 +5363,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				for (const server of startupLspServers) server.status = "connecting";
 				void (async () => {
 					try {
-						const result = await logger.time("warmupLspServers", warmupLspServers, cwd);
+						const result = await logger.time("warmupLspServers", warmupLspServers, cwd, {
+							policy: toolSession.getLspPolicy?.(),
+						});
 						const serversByName = new Map(result.servers.map(server => [server.name, server] as const));
 						for (const server of startupLspServers) {
 							const next = serversByName.get(server.name);

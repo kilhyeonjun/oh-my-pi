@@ -531,6 +531,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const enableDiagnostics = cfgLspDiagnosticsOnWrite.get(settings);
 		const dedup = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(settings);
 		const writethrough = createLspWritethrough(this.session.cwd, {
+			policy: this.session.getLspPolicy?.(),
 			enableFormat: cfgLspFormatOnWrite.get(settings),
 			enableDiagnostics,
 			transformDiagnostics: dedup

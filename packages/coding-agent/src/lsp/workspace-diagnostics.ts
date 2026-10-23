@@ -1,12 +1,34 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
+import { resolveCommand } from "./config";
+import type { LspPolicy } from "./types";
+
+async function authorizeWorkspaceCommand(
+	command: string[],
+	cwd: string,
+	signal?: AbortSignal,
+	policy?: LspPolicy,
+): Promise<string[]> {
+	if (!policy) return command;
+	throwIfAborted(signal);
+	const executable = resolveCommand(command[0]!, cwd);
+	if (!executable || !path.isAbsolute(executable)) throw new Error(`Cannot resolve workspace checker: ${command[0]}`);
+	const args = command.slice(1);
+	await policy.beforeExecute(
+		{ purpose: "workspace_check", command: executable, args, cwd: path.resolve(cwd) },
+		signal,
+	);
+	throwIfAborted(signal);
+	return [executable, ...args];
+}
 
 /** Project type detection result */
 export interface ProjectType {
 	type: "rust" | "typescript" | "go" | "python" | "unknown";
 	command?: string[];
 	description: string;
+	error?: string;
 }
 
 /**
@@ -55,10 +77,15 @@ function parseGoWorkspaceBuildPatterns(output: string): string[] {
 }
 
 /** Resolve the `go build` command for a `go.work` workspace. */
-async function resolveGoWorkspaceDiagnosticsCommand(cwd: string, signal?: AbortSignal): Promise<string[]> {
+async function resolveGoWorkspaceDiagnosticsCommand(
+	cwd: string,
+	signal?: AbortSignal,
+	policy?: LspPolicy,
+): Promise<string[]> {
 	const fallback = ["go", "build", "./..."];
+	const command = await authorizeWorkspaceCommand(["go", "work", "edit", "-json"], cwd, signal, policy);
 	try {
-		const proc = Bun.spawn(["go", "work", "edit", "-json"], {
+		const proc = Bun.spawn(command, {
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -103,7 +130,11 @@ async function resolveGoWorkspaceDiagnosticsCommand(cwd: string, signal?: AbortS
  * `pyrightconfig.json` — those pairs are two markers for one toolchain, not
  * two separate languages.
  */
-export async function detectProjectTypes(cwd: string, signal?: AbortSignal): Promise<ProjectType[]> {
+export async function detectProjectTypes(
+	cwd: string,
+	signal?: AbortSignal,
+	policy?: LspPolicy,
+): Promise<ProjectType[]> {
 	const detected: ProjectType[] = [];
 	const marker = (name: string) => fs.existsSync(path.join(cwd, name));
 
@@ -119,11 +150,20 @@ export async function detectProjectTypes(cwd: string, signal?: AbortSignal): Pro
 
 	// Check for Go workspaces before single-module Go projects.
 	if (marker("go.work")) {
-		detected.push({
-			type: "go",
-			command: await resolveGoWorkspaceDiagnosticsCommand(cwd, signal),
-			description: "Go workspace (go build)",
-		});
+		try {
+			detected.push({
+				type: "go",
+				command: await resolveGoWorkspaceDiagnosticsCommand(cwd, signal, policy),
+				description: "Go workspace (go build)",
+			});
+		} catch (error) {
+			throwIfAborted(signal);
+			detected.push({
+				type: "go",
+				description: "Go workspace (go build)",
+				error: `Failed to run go work edit -json: ${error}`,
+			});
+		}
 	} else if (marker("go.mod")) {
 		detected.push({ type: "go", command: ["go", "build", "./..."], description: "Go (go build)" });
 	}
@@ -189,13 +229,20 @@ async function mapWithConcurrency<T, R>(
 }
 
 /** Run one language's checker and render its output. */
-async function runProjectDiagnostics(cwd: string, projectType: ProjectType, signal?: AbortSignal): Promise<string> {
+async function runProjectDiagnostics(
+	cwd: string,
+	projectType: ProjectType,
+	signal?: AbortSignal,
+	policy?: LspPolicy,
+): Promise<string> {
+	if (projectType.error) return projectType.error;
 	const command = projectType.command;
 	if (!command) {
 		return "Cannot detect project type. Supported: Rust (Cargo.toml), TypeScript (tsconfig.json), Go (go.work/go.mod), Python (pyproject.toml)";
 	}
 	try {
-		const proc = Bun.spawn(command, {
+		const authorizedCommand = await authorizeWorkspaceCommand(command, cwd, signal, policy);
+		const proc = Bun.spawn(authorizedCommand, {
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -249,9 +296,10 @@ async function runProjectDiagnostics(cwd: string, projectType: ProjectType, sign
 export async function runWorkspaceDiagnostics(
 	cwd: string,
 	signal?: AbortSignal,
+	policy?: LspPolicy,
 ): Promise<{ output: string; projectType: ProjectType; projectTypes: ProjectType[] }> {
 	throwIfAborted(signal);
-	const projectTypes = await detectProjectTypes(cwd, signal);
+	const projectTypes = await detectProjectTypes(cwd, signal, policy);
 	const primary = projectTypes[0] ?? { type: "unknown" as const, description: "Unknown project type" };
 	// Keep the single-language shape byte-identical; only name every checker
 	// when more than one actually ran.
@@ -260,7 +308,7 @@ export async function runWorkspaceDiagnostics(
 
 	const outputs = await mapWithConcurrency(projectTypes, MAX_CONCURRENT_CHECKERS, async detectedType => ({
 		description: detectedType.description,
-		output: await runProjectDiagnostics(cwd, detectedType, signal),
+		output: await runProjectDiagnostics(cwd, detectedType, signal, policy),
 	}));
 
 	return { output: combineDiagnosticsOutputs(outputs), projectType, projectTypes };

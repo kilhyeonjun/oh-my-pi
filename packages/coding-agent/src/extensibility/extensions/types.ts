@@ -1071,6 +1071,35 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string[];
 }
 
+/** Fired before starting an LSP server, linter, or workspace checker. Paths are absolute. */
+export interface LspBeforeExecuteEvent {
+	type: "lsp_before_execute";
+	purpose: "server" | "linter" | "workspace_check";
+	/** Absolute executable path, exactly matching the spawned argv[0]. */
+	command: string;
+	args: string[];
+	cwd: string;
+}
+
+/** Conservative description of a filesystem change; all paths are absolute. */
+export type LspFileChange =
+	| { kind: "edit"; path: string }
+	| { kind: "create"; path: string; overwrite: boolean }
+	| { kind: "rename"; oldPath: string; newPath: string; overwrite: boolean }
+	| { kind: "delete"; path: string; recursive: boolean };
+
+export interface LspBeforeEditEvent {
+	type: "lsp_before_edit";
+	origin: "server_request" | "rename" | "code_action" | "file_rename" | "format";
+	cwd: string;
+	changes: LspFileChange[];
+}
+
+export interface LspBeforeEffectEventResult {
+	block?: boolean;
+	reason?: string;
+}
+
 /** Fired in the parent session before a subagent (task tool or eval `agent()`) resolves its model. */
 export interface BeforeSubagentSpawnEvent {
 	type: "before_subagent_spawn";
@@ -1475,6 +1504,8 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| BeforeSubagentSpawnEvent
+	| LspBeforeExecuteEvent
+	| LspBeforeEditEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| SessionStopEvent
@@ -1681,6 +1712,8 @@ export interface ExtensionAPI {
 		event: "before_subagent_spawn",
 		handler: ExtensionHandler<BeforeSubagentSpawnEvent, BeforeSubagentSpawnEventResult>,
 	): void;
+	on(event: "lsp_before_execute", handler: ExtensionHandler<LspBeforeExecuteEvent, LspBeforeEffectEventResult>): void;
+	on(event: "lsp_before_edit", handler: ExtensionHandler<LspBeforeEditEvent, LspBeforeEffectEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;

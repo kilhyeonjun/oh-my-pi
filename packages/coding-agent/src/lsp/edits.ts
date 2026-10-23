@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEexist, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import type { LspFileChange } from "../extensibility/extensions/types";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type {
@@ -287,6 +288,37 @@ function planDocumentChanges(documentChanges: NonNullable<WorkspaceEdit["documen
 	}
 
 	return ops;
+}
+
+/** Conservative policy payload, built from the same ordered plan used for application. */
+export function describeWorkspaceEdit(edit: WorkspaceEdit): LspFileChange[] {
+	const filePath = (uri: string): string => {
+		const result = uriToFile(uri);
+		if (!uri.startsWith("file:") || !path.isAbsolute(result)) {
+			throw new ToolError(`LSP workspace edit requires an absolute file URI: ${uri}`);
+		}
+		return result;
+	};
+	const ops: WorkspaceEditOp[] = edit.documentChanges
+		? planDocumentChanges(edit.documentChanges)
+		: Object.entries(edit.changes ?? {}).map(([uri, edits]) => ({ kind: "text", uri, edits }));
+	return ops.map((op): LspFileChange => {
+		switch (op.kind) {
+			case "text":
+				return { kind: "edit", path: filePath(op.uri) };
+			case "create":
+				return { kind: "create", path: filePath(op.uri), overwrite: op.options?.overwrite ?? false };
+			case "rename":
+				return {
+					kind: "rename",
+					oldPath: filePath(op.oldUri),
+					newPath: filePath(op.newUri),
+					overwrite: op.options?.overwrite ?? false,
+				};
+			case "delete":
+				return { kind: "delete", path: filePath(op.uri), recursive: op.options?.recursive ?? false };
+		}
+	});
 }
 
 /** One filesystem mutation actually performed by {@link applyWorkspaceEdit}. */

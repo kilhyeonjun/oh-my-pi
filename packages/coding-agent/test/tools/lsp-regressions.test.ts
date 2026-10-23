@@ -10,6 +10,9 @@ import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers"
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
+import * as lspmux from "@oh-my-pi/pi-coding-agent/lsp/lspmux";
+import * as lspDaemon from "@oh-my-pi/pi-coding-agent/lsp/mux/daemon";
+import { clearLinterClientCache, getLinterClient } from "@oh-my-pi/pi-coding-agent/lsp/clients";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
 import {
 	configCache,
@@ -32,6 +35,7 @@ import {
 	type DeleteFile,
 	type Diagnostic,
 	type LspClient,
+	type LspPolicy,
 	lspSchema,
 	type RenameFile,
 	type ServerConfig,
@@ -396,6 +400,177 @@ afterEach(() => {
 describe("lsp regressions", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("retries a denied scoped spawn without a pending lock or initialization backoff", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-policy-retry-");
+		const server = installHandshakeLsp();
+		const execute = vi.fn(async (): Promise<void> => {
+			throw new Error("execution denied");
+		});
+		const policy: LspPolicy = { scope: "retry", beforeExecute: execute, beforeEdit: async () => {} };
+		const config: ServerConfig = {
+			command: process.execPath,
+			args: ["fake-lsp"],
+			fileTypes: [".ts"],
+			rootMarkers: [],
+		};
+		try {
+			await expect(lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, policy)).rejects.toThrow(
+				"execution denied",
+			);
+			expect(server.spawnCount).toBe(0);
+			expect(await lspClient.getActiveOrPendingClient(config, tempDir.path(), undefined, policy)).toBeUndefined();
+			execute.mockImplementation(async () => {});
+			const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, policy);
+			expect(client.status).toBe("ready");
+			expect(server.spawnCount).toBe(1);
+			expect(execute).toHaveBeenLastCalledWith(
+				{ purpose: "server", command: process.execPath, args: ["fake-lsp"], cwd: tempDir.path() },
+				undefined,
+			);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("never probes lspmux or attaches to the shared broker under a policy", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-policy-private-");
+		vi.spyOn(lspmux, "isLspmuxSupported").mockReturnValue(true);
+		const mux = vi.spyOn(lspmux, "getLspmuxCommand");
+		const shared = vi.spyOn(lspDaemon, "connectSharedLspTransport");
+		const policy: LspPolicy = { scope: "private", beforeExecute: async () => {}, beforeEdit: async () => {} };
+		try {
+			lspClient.setSharedLspEnabled(true);
+			installHandshakeLsp();
+			await lspClient.getOrCreateClient(
+				{ command: process.execPath, fileTypes: [".ts"], rootMarkers: [] },
+				tempDir.path(),
+				1_000,
+				undefined,
+				policy,
+			);
+			expect(mux).not.toHaveBeenCalled();
+			expect(shared).not.toHaveBeenCalled();
+		} finally {
+			lspClient.setSharedLspEnabled(false);
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("isolates protected scopes from ordinary clients and reloads only its own identities", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-policy-scopes-");
+		const config: ServerConfig = { command: process.execPath, fileTypes: [".ts"], rootMarkers: [] };
+		const policy: LspPolicy = { scope: "first", beforeExecute: async () => {}, beforeEdit: async () => {} };
+		try {
+			installHandshakeLsp();
+			const ordinary = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+			installHandshakeLsp();
+			const protectedClient = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, policy);
+			installHandshakeLsp();
+			const otherPolicy = { ...policy, scope: "second" };
+			const other = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, otherPolicy);
+			expect(protectedClient).not.toBe(ordinary);
+			expect(other).not.toBe(protectedClient);
+			expect(await lspClient.shutdownStaleClients(tempDir.path(), [config], undefined, policy)).toEqual([]);
+			expect(await lspClient.getActiveOrPendingClient(config, tempDir.path(), undefined, policy)).toBe(
+				protectedClient,
+			);
+			await lspClient.shutdownScopedClients(policy.scope);
+			expect(await lspClient.getActiveOrPendingClient(config, tempDir.path(), undefined, policy)).toBeUndefined();
+			expect(await lspClient.getActiveOrPendingClient(config, tempDir.path())).toBe(ordinary);
+			expect(await lspClient.getActiveOrPendingClient(config, tempDir.path(), undefined, otherPolicy)).toBe(other);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	for (const allowed of [false, true]) {
+		it(`gates server workspace/applyEdit before writing (${allowed ? "allow" : "deny"})`, async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-policy-edit-");
+			const target = path.join(tempDir.path(), "a.ts");
+			await Bun.write(target, "before");
+			const beforeEdit = vi.fn(async () => {
+				if (!allowed) throw new Error("edit denied");
+			});
+			const policy: LspPolicy = { scope: `apply-${allowed}`, beforeExecute: async () => {}, beforeEdit };
+			try {
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(
+					{ command: process.execPath, fileTypes: [".ts"], rootMarkers: [] },
+					tempDir.path(),
+					1_000,
+					undefined,
+					policy,
+				);
+				server.send({
+					jsonrpc: "2.0",
+					id: 9002,
+					method: "workspace/applyEdit",
+					params: {
+						edit: {
+							changes: {
+								[fileToUri(target)]: [
+									{
+										range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+										newText: "after",
+									},
+								],
+							},
+						},
+					},
+				});
+				const response = await server.waitFor(message => message.id === 9002 && message.method === undefined);
+				expect(response.result).toMatchObject({ applied: allowed });
+				expect(await Bun.file(target).text()).toBe(allowed ? "after" : "before");
+				expect(beforeEdit).toHaveBeenCalledTimes(1);
+				expect(beforeEdit).toHaveBeenCalledWith(
+					{ origin: "server_request", cwd: tempDir.path(), changes: [{ kind: "edit", path: target }] },
+					undefined,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+	}
+
+	it("passes policies into custom linter factories and isolates their cache", () => {
+		const factory = vi.fn((_config: ServerConfig, _cwd: string, _policy?: LspPolicy) => ({
+			format: async (_file: string, content: string) => content,
+			lint: async () => [],
+		}));
+		const config: ServerConfig = { command: "custom", fileTypes: [".ts"], rootMarkers: [], createClient: factory };
+		const policy: LspPolicy = { scope: "linter-first", beforeExecute: async () => {}, beforeEdit: async () => {} };
+		try {
+			const ordinary = getLinterClient("custom-policy-cache", config, process.cwd());
+			const scoped = getLinterClient("custom-policy-cache", config, process.cwd(), policy);
+			const other = getLinterClient("custom-policy-cache", config, process.cwd(), {
+				...policy,
+				scope: "linter-second",
+			});
+			expect(scoped).not.toBe(ordinary);
+			expect(other).not.toBe(scoped);
+			expect(getLinterClient("custom-policy-cache", config, process.cwd(), policy)).toBe(scoped);
+			expect(factory).toHaveBeenCalledTimes(3);
+			expect(factory).toHaveBeenCalledWith(config, process.cwd(), policy);
+		} finally {
+			clearLinterClientCache();
+		}
+	});
+
+	it("rejects non-file and relative workspace edits before the policy or filesystem runs", async () => {
+		const beforeEdit = vi.fn(async () => {});
+		const policy: LspPolicy = { scope: "invalid-edit", beforeExecute: async () => {}, beforeEdit };
+		for (const uri of ["untitled:buffer", "relative.ts"]) {
+			await expect(
+				lspClient.applyWorkspaceEditWithLsp({ changes: { [uri]: [] } }, process.cwd(), undefined, policy),
+			).rejects.toThrow("absolute file URI");
+		}
+		expect(beforeEdit).not.toHaveBeenCalled();
 	});
 
 	it("detects bracket-style glob patterns", () => {
@@ -5028,7 +5203,13 @@ describe("lsp regressions", () => {
 			expect(loadConfigSpy).toHaveBeenCalledTimes(3);
 			expect(starOutput).toContain("Reloaded test-lsp");
 			expect(omittedOutput).toContain("Reloaded test-lsp");
-			expect(lspClient.getOrCreateClient).toHaveBeenCalledWith(server, tempDir.path(), undefined, expect.anything());
+			expect(lspClient.getOrCreateClient).toHaveBeenCalledWith(
+				server,
+				tempDir.path(),
+				undefined,
+				expect.anything(),
+				undefined,
+			);
 		} finally {
 			vi.restoreAllMocks();
 			tempDir.removeSync();
