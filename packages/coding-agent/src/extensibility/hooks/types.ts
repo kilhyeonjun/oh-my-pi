@@ -308,6 +308,9 @@ export type {
  * Fired before a tool is executed. Hooks can block execution.
  */
 export interface ToolCallEvent {
+	/** Exact native MCP origin; both fields are present together or absent, independent of input. */
+	readonly mcpServerName?: string;
+	readonly mcpToolName?: string;
 	type: "tool_call";
 	/** Tool name (e.g., "bash", "edit", "write") */
 	toolName: string;

@@ -560,6 +560,8 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
+`tool_call` events (including legacy hooks) and `getAllTools()` entries expose readonly optional `mcpServerName` and `mcpToolName` together for native MCP tools. These are the exact, unnormalized transport server/tool names of the tool actually selected by the registry, not values inferred from its display name or arguments. They survive deferred connections, reconnects, and subagent proxy refreshes. Built-ins, extension/SDK tools that merely set public MCP fields, RPC host tools, and pending tools whose identities were parsed from names have neither field. Policies should compare both fields rather than parse `toolName`; normalized-name collisions report only the selected winner's origin. This is provenance against public-field/model-input spoofing, not a sandbox for arbitrary trusted JavaScript importing internal modules.
+
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
 
 ### Plan review lifecycle

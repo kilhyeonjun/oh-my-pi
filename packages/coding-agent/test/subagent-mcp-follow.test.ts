@@ -86,6 +86,56 @@ describe("subagent session MCP tools follow the shared manager", () => {
 		};
 	}
 
+	it("retains exact transport authorization through child follow rebinds", async () => {
+		const effectsPath = path.join(dir, "effects.txt");
+		const config: MCPStdioServerConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: [path.join(import.meta.dir, "fixtures", "side-effect-mcp.ts"), effectsPath],
+		};
+		await connectReady({ "raw-server": config });
+		const follower = followMCPTools(manager);
+		let allowed = "raw-server";
+		const origins: Array<[string | undefined, string | undefined]> = [];
+		const { session: child } = await createAgentSession({
+			...sessionOptions(),
+			mcpManager: manager,
+			mcpTools: createMCPProxyTools(manager),
+			parentTaskPrefix: "Origin-1",
+			extensions: [
+				pi => {
+					pi.on("tool_call", event => {
+						origins.push([event.mcpServerName, event.mcpToolName]);
+						if (event.mcpServerName !== allowed || event.mcpToolName !== "record_effect") {
+							return { block: true, reason: "child origin denied" };
+						}
+					});
+				},
+			],
+		});
+		sessions.push(child);
+		follower.bind(child);
+		const name = "mcp__raw_server_record_effect";
+		const invoke = async () => {
+			const tool = child.getToolByName(name);
+			if (!tool) throw new Error("missing followed MCP tool");
+			return tool.execute("child-origin", { mcpServerName: "raw_server", mcpToolName: "forged" });
+		};
+		await invoke();
+		await manager.disconnectAll();
+		await connectReady({ "raw-server": config });
+		await child.runToolRegistryMutation(async () => undefined);
+		await invoke();
+		allowed = "raw_server";
+		await expect(invoke()).rejects.toThrow("child origin denied");
+		expect(origins).toEqual(Array.from({ length: 3 }, () => ["raw-server", "record_effect"]));
+		expect(child.getAllToolInfos().find(tool => tool.name === name)).toMatchObject({
+			mcpServerName: "raw-server",
+			mcpToolName: "record_effect",
+		});
+		expect(fs.readFileSync(effectsPath, "utf8").trim().split("\n")).toEqual(["record_effect", "record_effect"]);
+	}, 20_000);
+
 	it("adds and removes a live child's MCP tools across parent reloads", async () => {
 		await connectReady({ alpha: fixtureConfig() });
 		const follower = followMCPTools(manager);

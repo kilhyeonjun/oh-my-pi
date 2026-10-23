@@ -986,6 +986,9 @@ export interface SourceInfo {
 
 /** Tool metadata returned by {@link ExtensionAPI.getAllTools}: identity, schema, and source provenance. */
 export interface ToolInfo {
+	/** Exact native MCP origin; both fields are present together or absent. Never inferred from names. */
+	readonly mcpServerName?: string;
+	readonly mcpToolName?: string;
 	name: string;
 	description: string;
 	parameters: TSchema;
@@ -1329,6 +1332,9 @@ export interface PlanReviewResolvedEvent {
 }
 
 interface ToolCallEventBase {
+	/** Exact native MCP origin; both fields are present together or absent, independent of input. */
+	readonly mcpServerName?: string;
+	readonly mcpToolName?: string;
 	type: "tool_call";
 	toolCallId: string;
 }

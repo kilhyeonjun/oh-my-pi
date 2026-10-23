@@ -18,6 +18,7 @@ import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../e
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
+import { getMCPToolOrigin } from "../mcp/tool-origin";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -801,7 +802,13 @@ export class SessionTools {
 				scope: "temporary",
 				origin: "top-level",
 			};
-			return { name, description: tool.description, parameters: tool.parameters, sourceInfo };
+			return {
+				name,
+				description: tool.description,
+				parameters: tool.parameters,
+				sourceInfo,
+				...getMCPToolOrigin(tool),
+			};
 		});
 	}
 

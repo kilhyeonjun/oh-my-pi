@@ -28,6 +28,7 @@ import { formatApprovalArguments } from "../tools/approval";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
+import { attestMCPToolOrigin } from "./tool-origin";
 import { formatMCPToolFailure, MCPTransportError } from "./errors";
 import { describeMCPCall, describeMCPResult, renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
 import type {
@@ -754,6 +755,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = connection.name;
+		attestMCPToolOrigin(this, connection.name, tool.name);
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;
 	}
 
@@ -898,6 +900,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
+		attestMCPToolOrigin(this, serverName, tool.name);
 		this.mcpReadOnlyHint = tool.annotations?.readOnlyHint;
 		this.#fallbackProvider = source?.provider;
 		this.#fallbackProviderName = source?.providerName;

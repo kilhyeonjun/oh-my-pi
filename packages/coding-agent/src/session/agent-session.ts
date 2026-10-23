@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { getMCPToolOrigin } from "../mcp/tool-origin";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -5343,6 +5344,7 @@ export class AgentSession implements SettingsScope {
 			callResult = await runner.emitToolCall(
 				{
 					type: "tool_call",
+					...getMCPToolOrigin(ctx.tool),
 					toolName: ctx.tool.name,
 					toolCallId: ctx.toolCall.id,
 					input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),

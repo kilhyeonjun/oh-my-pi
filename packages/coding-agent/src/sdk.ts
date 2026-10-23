@@ -163,6 +163,7 @@ import {
 import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
+import { inheritMCPToolOrigin } from "./mcp/tool-origin";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionState } from "./mnemopi/state";
@@ -1477,6 +1478,7 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 			: undefined,
 		[TOOL_DEFINITION_MARKER]: true,
 	};
+	inheritMCPToolOrigin(tool, definition);
 	return definition;
 }
 

@@ -27,6 +27,7 @@ import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
+import { getMCPToolOrigin } from "../../mcp/tool-origin";
 import type { ExtensionRunner } from "./runner";
 import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
 
@@ -295,6 +296,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const callResult = (await this.runner.emitToolCall(
 					{
 						type: "tool_call",
+						...getMCPToolOrigin(this.tool),
 						toolName: this.tool.name,
 						toolCallId,
 						input: normalizeToolEventInput(

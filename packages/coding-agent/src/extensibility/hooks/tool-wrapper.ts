@@ -10,6 +10,7 @@ import {
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
+import { getMCPToolOrigin } from "../../mcp/tool-origin";
 import type { HookRunner } from "./runner";
 import type { ToolCallEventResult, ToolResultEventResult } from "./types";
 
@@ -55,6 +56,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 			try {
 				const callResult = (await this.hookRunner.emitToolCall({
 					type: "tool_call",
+					...getMCPToolOrigin(this.tool),
 					toolName: this.tool.name,
 					toolCallId,
 					input: normalizeToolEventInput(

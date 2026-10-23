@@ -4,6 +4,7 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
+import { inheritMCPToolOrigin } from "../mcp/tool-origin";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
@@ -961,7 +962,7 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 	return mcpManager.getTools().map(tool => {
 		const serverName = tool.mcpServerName ?? "";
 		const mcpToolName = tool.mcpToolName ?? "";
-		return {
+		const proxy: CustomTool = {
 			name: tool.name,
 			label: tool.label ?? tool.name,
 			description: tool.description ?? "",
@@ -1005,6 +1006,8 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 				}
 			},
 		};
+		inheritMCPToolOrigin(tool, proxy);
+		return proxy;
 	});
 }
 
