@@ -7,7 +7,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
+import { getProjectDir, logger, readJsonl, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
 import type {
@@ -18,9 +18,17 @@ import type {
 	MCPRequestOptions,
 	MCPStdioServerConfig,
 	MCPTransport,
+	MCPTransportOptions,
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
-import { createMCPJsonRpcError, MCPTransportError, normalizeMCPTransportError } from "../errors";
+import { runMCPAdmission } from "../admission";
+import {
+	createMCPJsonRpcError,
+	isMCPAdmissionError,
+	MCPAdmissionError,
+	MCPTransportError,
+	normalizeMCPTransportError,
+} from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import { isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../timeout";
 import { isThenable } from "../../utils/ipc";
@@ -538,19 +546,25 @@ export async function terminateStdioProcess(
 	if (!exitedOnTerm) await waitForProcessExit(proc.exited, KILL_GRACE_MS);
 }
 
+interface PendingStdioRequest {
+	resolve: (value: unknown) => void;
+	reject: (error: Error) => void;
+	/** Guarded requests cannot accept a response before wire admission. */
+	sent?: boolean;
+}
+
 /**
  * Stdio transport for MCP servers.
  * Spawns a subprocess and communicates via stdin/stdout.
  */
 export class StdioTransport implements MCPTransport {
 	#process: Subprocess<"pipe", "pipe", "pipe"> | null = null;
-	#pendingRequests = new Map<
-		string | number,
-		{
-			resolve: (value: unknown) => void;
-			reject: (error: Error) => void;
-		}
-	>();
+	#pendingRequests = new Map<string | number, PendingStdioRequest>();
+	#lifecycle: AbortController | undefined;
+	#sendTasks: Set<Promise<void>> | undefined;
+	#pendingCallbacks = 0;
+	#closePromise: Promise<void> | undefined;
+	#ownerAbort: (() => void) | undefined;
 	#connected = false;
 	#readLoop: Promise<void> | null = null;
 	/**
@@ -566,7 +580,77 @@ export class StdioTransport implements MCPTransport {
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
 
-	constructor(private config: MCPStdioServerConfig) {}
+	constructor(
+		private config: MCPStdioServerConfig,
+		private readonly transportOptions?: MCPTransportOptions,
+		private readonly connectSignal?: AbortSignal,
+	) {
+		if (transportOptions) {
+			this.transportOptions = Object.freeze({ ...transportOptions });
+		}
+		if (transportOptions || connectSignal) this.#lifecycle = new AbortController();
+	}
+
+	#operationSignal(signal?: AbortSignal, retired?: AbortSignal): AbortSignal | undefined {
+		const owner = this.transportOptions?.signal;
+		const lifetime = this.#lifecycle?.signal;
+		if (!owner && !retired) return lifetime ? (signal ? AbortSignal.any([signal, lifetime]) : lifetime) : signal;
+		const signals: AbortSignal[] = [];
+		if (signal) signals.push(signal);
+		if (retired) signals.push(retired);
+		if (owner) signals.push(owner);
+		if (lifetime) signals.push(lifetime);
+		return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+	}
+
+	#own(task: Promise<void>): Promise<void> {
+		this.#sendTasks ??= new Set();
+		const tasks = this.#sendTasks;
+		tasks.add(task);
+		void task.then(
+			() => tasks.delete(task),
+			() => tasks.delete(task),
+		);
+		return task;
+	}
+
+	#guardedSend(
+		proc: Subprocess<"pipe", "pipe", "pipe">,
+		frame: string,
+		signal: AbortSignal,
+		current?: () => boolean,
+	): Promise<void> {
+		const stdin = proc.stdin;
+		const task = (async () => {
+			await runMCPAdmission(signal, async () => {
+				this.#pendingCallbacks++;
+				try {
+					return await this.transportOptions!.beforeSend!(
+						Object.freeze({ transport: "stdio", body: frame, signal }),
+					);
+				} finally {
+					this.#pendingCallbacks--;
+				}
+			});
+			signal.throwIfAborted();
+			if (!this.#connected || this.#process !== proc || proc.stdin !== stdin)
+				throw new MCPTransportError({
+					transport: "stdio",
+					stage: "send",
+					failure: "closed",
+					message: "MCP stdio transport changed before send",
+					retryable: false,
+				});
+			if (current && !current()) return;
+			const wrote = stdin.write(frame);
+			if (isThenable(wrote)) await untilAborted(signal, Promise.resolve(wrote));
+			signal.throwIfAborted();
+			if (!this.#connected || this.#process !== proc || (current && !current())) return;
+			const flushed = stdin.flush();
+			if (isThenable(flushed)) await untilAborted(signal, Promise.resolve(flushed));
+		})();
+		return this.#own(task);
+	}
 
 	get connected(): boolean {
 		return this.#connected;
@@ -578,17 +662,37 @@ export class StdioTransport implements MCPTransport {
 	async connect(): Promise<void> {
 		if (this.#connected) return;
 
-		const env = {
-			...Bun.env,
-			...this.config.env,
-		};
-		const cwd = this.config.cwd ?? getProjectDir();
+		const signal = this.#lifecycle ? this.#operationSignal(this.connectSignal) : undefined;
+		signal?.throwIfAborted();
+		const env =
+			this.transportOptions?.stdioEnv !== undefined
+				? { ...this.transportOptions.stdioEnv }
+				: { ...Bun.env, ...this.config.env };
+		const configuredCwd = this.config.cwd ?? getProjectDir();
+		const cwd = this.transportOptions ? path.resolve(configuredCwd) : configuredCwd;
 		const spawnCommand = await resolveStdioSpawnCommand(this.config, {
 			cwd,
 			env,
 			platform: process.platform,
 			hostHasInheritableConsole: hostHasInheritableConsole(),
 		});
+
+		signal?.throwIfAborted();
+		const argv = spawnCommand.cmd;
+		if (this.transportOptions?.beforeSpawn) {
+			Object.freeze(argv);
+			if (!signal) throw new MCPAdmissionError();
+			const event = Object.freeze({ argv, cwd, env: Object.freeze(env), signal });
+			await runMCPAdmission(signal, async () => {
+				this.#pendingCallbacks++;
+				try {
+					return await this.transportOptions!.beforeSpawn!(event);
+				} finally {
+					this.#pendingCallbacks--;
+				}
+			});
+		}
+		signal?.throwIfAborted();
 
 		// Platform-derived session and console-window handling come from
 		// `resolveStdioSpawnCommand`: Linux/other POSIX detach into their own
@@ -600,7 +704,7 @@ export class StdioTransport implements MCPTransport {
 		// triggers macOS Apple Events TCC prompts uses the same shape; the
 		// one-object `{ cmd }` overload timed out before prompting for `mcpbridge`
 		// even with `detached: false` (#5085).
-		this.#process = Bun.spawn(spawnCommand.cmd, {
+		this.#process = Bun.spawn(argv, {
 			cwd,
 			env,
 			stdin: "pipe",
@@ -613,6 +717,15 @@ export class StdioTransport implements MCPTransport {
 		this.#detached = spawnCommand.detached;
 
 		this.#connected = true;
+		const owner = this.transportOptions?.signal;
+		if (owner && !this.#ownerAbort) {
+			this.#ownerAbort = () => {
+				this.#lifecycle?.abort(owner.reason);
+				void this.close().catch(() => {});
+			};
+			owner.addEventListener("abort", this.#ownerAbort, { once: true });
+			if (owner.aborted) this.#ownerAbort();
+		}
 
 		// Start reading stdout
 		this.#readLoop = this.#startReadLoop();
@@ -634,10 +747,19 @@ export class StdioTransport implements MCPTransport {
 				}
 			}
 		} catch (error) {
-			closeError = normalizeMCPTransportError(error, {
+			const normalized = normalizeMCPTransportError(error, {
 				transport: "stdio",
 				stage: error instanceof SyntaxError ? "decode" : "receive",
 			});
+			closeError = this.transportOptions?.beforeSend
+				? new MCPTransportError({
+						transport: "stdio",
+						stage: normalized.stage,
+						failure: normalized.failure,
+						message: "MCP stdio response stream failed",
+						retryable: normalized.retryable,
+					})
+				: normalized;
 			if (this.#connected) {
 				this.onError?.(closeError);
 			}
@@ -691,7 +813,27 @@ export class StdioTransport implements MCPTransport {
 		}
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			if (this.transportOptions?.beforeSend) {
+				const task = this.#own(this.#handleGuardedServerRequest(message as JsonRpcRequest));
+				void task.catch(error => {
+					const safe = isMCPAdmissionError(error)
+						? error
+						: new MCPTransportError({
+								transport: "stdio",
+								stage: "send",
+								failure: "unknown",
+								message: "MCP server response was not delivered",
+								retryable: false,
+							});
+					try {
+						this.onError?.(safe);
+					} catch {
+						/* Keep the owned rejection observed. */
+					}
+				});
+			} else {
+				void this.#handleServerRequest(message as JsonRpcRequest);
+			}
 			return;
 		}
 
@@ -699,10 +841,16 @@ export class StdioTransport implements MCPTransport {
 		if ("id" in message && message.id != null) {
 			const response = message as JsonRpcResponse;
 			const pending = this.#pendingRequests.get(response.id);
-			if (pending) {
+			if (pending && pending.sent !== false) {
 				this.#pendingRequests.delete(response.id);
 				if (response.error) {
-					pending.reject(createMCPJsonRpcError("stdio", response.error));
+					const error = this.transportOptions?.beforeSend
+						? {
+								code: Number.isSafeInteger(response.error.code) ? response.error.code : -32603,
+								message: "MCP server error",
+							}
+						: response.error;
+					pending.reject(createMCPJsonRpcError("stdio", error));
 				} else {
 					pending.resolve(response.result);
 				}
@@ -715,6 +863,35 @@ export class StdioTransport implements MCPTransport {
 			const notification = message as { method: string; params?: unknown };
 			this.onNotification?.(notification.method, notification.params);
 		}
+	}
+
+	async #handleGuardedServerRequest(request: JsonRpcRequest): Promise<void> {
+		const signal = this.#operationSignal();
+		if (!signal) throw new MCPAdmissionError();
+		const proc = this.#process;
+		if (!this.#connected || !proc) return;
+		let result: unknown;
+		let error: JsonRpcError | undefined;
+		try {
+			if (!this.onRequest) error = { code: -32601, message: "Method not found" };
+			else
+				result = await untilAborted(signal, async () => {
+					this.#pendingCallbacks++;
+					try {
+						return await this.onRequest!(request.method, request.params);
+					} finally {
+						this.#pendingCallbacks--;
+					}
+				});
+		} catch (cause) {
+			if (signal.aborted || isMCPAdmissionError(cause)) throw cause;
+			error = { code: -32603, message: "MCP request handler failed" };
+		}
+		signal.throwIfAborted();
+		const response = error
+			? { jsonrpc: "2.0" as const, id: request.id, error }
+			: { jsonrpc: "2.0" as const, id: request.id, result: result ?? {} };
+		await this.#guardedSend(proc, `${JSON.stringify(response)}\n`, signal);
 	}
 
 	async #handleServerRequest(request: JsonRpcRequest): Promise<void> {
@@ -753,6 +930,7 @@ export class StdioTransport implements MCPTransport {
 				message: "Transport closed",
 				retryable: true,
 			});
+		this.#lifecycle?.abort(closeError);
 		for (const [, pending] of this.#pendingRequests) {
 			pending.reject(closeError);
 		}
@@ -785,7 +963,10 @@ export class StdioTransport implements MCPTransport {
 		};
 
 		const timeout = resolveMCPTimeoutMs(this.config.timeout);
-		const signal = options?.signal;
+		const timed = isMCPTimeoutEnabled(timeout);
+		const sendRetired = this.transportOptions?.beforeSend ? new AbortController() : undefined;
+		const signal = this.#lifecycle ? this.#operationSignal(options?.signal, sendRetired?.signal) : options?.signal;
+		const deadline = sendRetired && timed ? performance.now() + timeout : Infinity;
 
 		if (signal?.aborted) {
 			const reason = signal.reason instanceof Error ? signal.reason : new Error("Aborted");
@@ -807,6 +988,7 @@ export class StdioTransport implements MCPTransport {
 				signal.removeEventListener("abort", onAbort);
 			}
 			this.#pendingRequests.delete(id);
+			sendRetired?.abort();
 		};
 
 		const onAbort = () => {
@@ -819,7 +1001,7 @@ export class StdioTransport implements MCPTransport {
 			signal.addEventListener("abort", onAbort, { once: true });
 		}
 
-		this.#pendingRequests.set(id, {
+		const pending: PendingStdioRequest = {
 			resolve: (value: unknown) => {
 				cleanup();
 				resolve(value as T);
@@ -828,10 +1010,13 @@ export class StdioTransport implements MCPTransport {
 				cleanup();
 				reject(error);
 			},
-		});
+		};
+		if (sendRetired) pending.sent = false;
+		this.#pendingRequests.set(id, pending);
 
-		if (isMCPTimeoutEnabled(timeout)) {
-			timer = setTimeout(() => {
+		let onTimeout: (() => void) | undefined;
+		if (timed) {
+			onTimeout = () => {
 				cleanup();
 				reject(
 					new MCPTransportError({
@@ -842,33 +1027,48 @@ export class StdioTransport implements MCPTransport {
 						retryable: false,
 					}),
 				);
-			}, timeout);
+			};
+			timer = setTimeout(onTimeout, timeout);
 		}
 
-		const stdin = this.#process.stdin;
+		const proc = this.#process;
+		const stdin = proc.stdin;
 		const message = `${JSON.stringify(request)}\n`;
 		const failFromSend = (error: unknown) => {
 			if (settled) return;
 			cleanup();
 			reject(normalizeMCPTransportError(error, { transport: "stdio", stage: "send" }));
 		};
-		try {
-			// Never `await` write/flush. Bun's FileSink returns a pending Promise
-			// once the OS pipe buffer fills (default ~64 KB on POSIX), and a
-			// subprocess that stops draining stdin will park those awaits forever.
-			// Awaiting here would keep the async fn stuck above `return promise`,
-			// past the timeout timer and the abort handler, orphaning the deferred
-			// rejection and hanging the caller (#3945). Route sync throws (Windows
-			// EPIPE) and async rejections (POSIX EPIPE on processTicksAndRejections)
-			// into `reject()` while leaving the returned promise free to settle
-			// from the response, timer, abort signal, or read-loop transport-close.
-			const wrote = stdin.write(message);
-			if (isThenable(wrote)) wrote.then(undefined, failFromSend);
-			const flushed = stdin.flush();
-			if (isThenable(flushed)) flushed.then(undefined, failFromSend);
-		} catch (error) {
-			failFromSend(error);
-		}
+		if (sendRetired) {
+			if (!signal) failFromSend(new MCPAdmissionError());
+			else
+				void this.#guardedSend(proc, message, signal, () => {
+					if (settled || this.#pendingRequests.get(id) !== pending) return false;
+					if (deadline !== Infinity && performance.now() >= deadline) {
+						onTimeout?.();
+						return false;
+					}
+					pending.sent = true;
+					return true;
+				}).catch(failFromSend);
+		} else
+			try {
+				// Never `await` write/flush. Bun's FileSink returns a pending Promise
+				// once the OS pipe buffer fills (default ~64 KB on POSIX), and a
+				// subprocess that stops draining stdin will park those awaits forever.
+				// Awaiting here would keep the async fn stuck above `return promise`,
+				// past the timeout timer and the abort handler, orphaning the deferred
+				// rejection and hanging the caller (#3945). Route sync throws (Windows
+				// EPIPE) and async rejections (POSIX EPIPE on processTicksAndRejections)
+				// into `reject()` while leaving the returned promise free to settle
+				// from the response, timer, abort signal, or read-loop transport-close.
+				const wrote = stdin.write(message);
+				if (isThenable(wrote)) wrote.then(undefined, failFromSend);
+				const flushed = stdin.flush();
+				if (isThenable(flushed)) flushed.then(undefined, failFromSend);
+			} catch (error) {
+				failFromSend(error);
+			}
 
 		return promise;
 	}
@@ -890,6 +1090,27 @@ export class StdioTransport implements MCPTransport {
 			params: params ?? {},
 		};
 
+		const frame = `${JSON.stringify(notification)}\n`;
+		if (this.transportOptions?.beforeSend) {
+			const signal = this.#operationSignal();
+			if (!signal) throw new MCPAdmissionError();
+			try {
+				await this.#guardedSend(this.#process, frame, signal);
+			} catch (cause) {
+				if (signal.aborted || isMCPAdmissionError(cause)) throw cause;
+				const error = new MCPTransportError({
+					transport: "stdio",
+					stage: "send",
+					failure: "eof",
+					message: "MCP notification was not delivered",
+					retryable: true,
+				});
+				this.#handleClose(error);
+				throw error;
+			}
+			return;
+		}
+
 		// Bun's FileSink can throw EPIPE synchronously on Windows when the
 		// subprocess has exited between the last read-loop tick and this
 		// write (e.g. an MCP server that dies after returning `initialize`
@@ -900,7 +1121,7 @@ export class StdioTransport implements MCPTransport {
 		// `initializeConnection()` runs before the manager installs its
 		// `onClose` handler, so a swallowed failure there would yield a
 		// "connected" handle wrapping a dead transport. See #1710.
-		if (!writeFrame(this.#process.stdin, `${JSON.stringify(notification)}\n`)) {
+		if (!writeFrame(this.#process.stdin, frame)) {
 			const error = new MCPTransportError({
 				transport: "stdio",
 				stage: "send",
@@ -913,7 +1134,39 @@ export class StdioTransport implements MCPTransport {
 		}
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (!this.#lifecycle) return this.#closeNative();
+		this.#lifecycle.abort();
+		// Publish the close task before callbacks can reenter resource teardown.
+		return (this.#closePromise ??= Promise.resolve().then(() => this.#closeGuarded()));
+	}
+
+	async #closeGuarded(): Promise<void> {
+		if (this.#ownerAbort) {
+			this.transportOptions?.signal?.removeEventListener("abort", this.#ownerAbort);
+			this.#ownerAbort = undefined;
+		}
+		await this.#closeNative();
+		if (this.#sendTasks?.size) await Promise.allSettled(this.#sendTasks);
+		if (this.#pendingCallbacks !== 0) {
+			const error = new MCPTransportError({
+				transport: "stdio",
+				stage: "receive",
+				failure: "unknown",
+				message: "MCP stdio callback drain is unconfirmed",
+				retryable: false,
+			});
+			logger.debug("MCP stdio local cleanup completed; callback drain unconfirmed");
+			try {
+				this.onError?.(error);
+			} catch {
+				/* Preserve the cleanup failure. */
+			}
+			throw error;
+		}
+	}
+
+	async #closeNative(): Promise<void> {
 		// `close()` is the authoritative resource teardown. `#handleClose()`
 		// may have already run (read-loop EOF, or a notify() write failure
 		// that surfaces the dead transport to the caller) and flipped
@@ -959,12 +1212,31 @@ export class StdioTransport implements MCPTransport {
 /**
  * Create and connect a stdio transport.
  */
-export async function createStdioTransport(config: MCPStdioServerConfig): Promise<StdioTransport> {
-	const transport = new StdioTransport(config);
+export async function createStdioTransport(
+	config: MCPStdioServerConfig,
+	transportOptions?: MCPTransportOptions,
+	connectSignal?: AbortSignal,
+): Promise<StdioTransport> {
+	const transport = new StdioTransport(config, transportOptions, connectSignal);
 	try {
 		await transport.connect();
+		transportOptions?.signal?.throwIfAborted();
+		connectSignal?.throwIfAborted();
 		return transport;
 	} catch (error) {
-		throw normalizeMCPTransportError(error, { transport: "stdio", stage: "connect" });
+		if (transportOptions || connectSignal)
+			await transport.close().catch(() => {
+				logger.debug("MCP stdio connection cleanup is unconfirmed");
+			});
+		const normalized = normalizeMCPTransportError(error, { transport: "stdio", stage: "connect" });
+		if (!transportOptions || isMCPAdmissionError(normalized)) throw normalized;
+		throw new MCPTransportError({
+			transport: "stdio",
+			stage: "connect",
+			failure: normalized.failure,
+			message: "MCP stdio connection failed",
+			code: normalized.code,
+			retryable: normalized.retryable,
+		});
 	}
 }

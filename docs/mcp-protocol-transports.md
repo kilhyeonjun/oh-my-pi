@@ -71,6 +71,18 @@ Transport implementations own framing and I/O details:
 
 `"sse"` uses the legacy HTTP+SSE transport: it opens the configured URL with GET, reads the `endpoint` event's plain-text URL/path, POSTs JSON-RPC requests to that endpoint, and receives JSON-RPC responses on the stream.
 
+## Optional runtime effect admission
+
+`connectToServer` accepts runtime-only `transportOptions`. Direct HTTP/stdio factories accept them as their optional second argument and a creation signal as the third; the legacy SSE factory preserves its creation signal as the second argument and accepts transport options third. These options are not accepted through MCP JSON config.
+
+- `beforeSend` sees a frozen event containing transport, the exact already-serialized body when present, HTTP method/URL when applicable, and the effective abort signal. Request headers and environment values are not part of send events. Every MCP transport HTTP fetch/redirect/resume/auth replay, notification, server response, and DELETE must pass admission; stdio gates each outgoing JSONL frame. Guarded remote connections require origin-locked headers.
+- `beforeSpawn` sees the final selected immutable argv, cwd, exact child environment, and creation signal immediately before native spawn. `stdioEnv`, when supplied, replaces both ambient and config environment rather than merging either. Bare-command availability therefore depends on the selected child's PATH, not the launcher's shell PATH; the SDK does not expand a global PATH or import credentials to repair it.
+- Callbacks must return/resolve `undefined`. Exceptions and non-void results fail with terminal, redacted `MCPAdmissionError`; thrown callback diagnostics are not retained as denial causes or payloads. HTTP auth challenges remain in internal native custody for the existing OAuth analyzer rather than operator-facing transport errors. Guarded streamed error shapes require a safe-integer code and string message; malformed fields produce a fixed native malformed-response diagnostic, while valid numeric JSON-RPC errors remain distinguishable without remote text/data.
+- Existing request deadlines, caller cancellation, owner revocation, and transport close end transport-facing waits even if an asynchronous callback never settles. Guarded HTTP keeps one logical request budget through auth refresh and retry; the current operation signal reaches the existing auth hook and manager preflight, so a late allow cannot restart an expired request. Already-admitted credential rotation may complete in native custody, not as an attested remote cancellation. Late permission cannot resume a retired spawn/send. Stdio keeps its response deferred independent of pipe write/flush waits. Guarded stdio and legacy SSE ignore premature matching replies until the same pending request reaches its admitted physical send. A denied server response never triggers a compensating unapproved error response.
+- Creation cancellation owns late instances through factory/client cleanup. Successful creation does not turn a handshake-only cancellation signal into an unrelated lifetime grant. Close retains native stream/process cleanup and observes late callback rejections, but does not promise that arbitrary callback code or remote work stopped. Undrained callbacks/failed remote termination are reported as unconfirmed through safe diagnostics or close failure; connection failure is not a cleanup attestation.
+
+The caller supplies the policy and must not interpret an SDK callback or successful discovery as human authorization. No-hook callers keep the existing transport API and behavior.
+
 ## JSON-RPC message flow and correlation
 
 ## Request IDs

@@ -42,6 +42,8 @@ import {
 import type { MCPStoredOAuthCredential } from "./oauth-flow";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
+import { runMCPAdmission } from "./admission";
+import { MCPAdmissionError, isMCPAdmissionError } from "./errors";
 
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
@@ -49,6 +51,9 @@ import type { MCPToolCache } from "./tool-cache";
 import { setGeneratedHeader } from "./transports/header-policy";
 import type {
 	MCPAuthChallenge,
+	MCPBeforeAuthEvent,
+	MCPManagerAdmission,
+	MCPServerAdmission,
 	MCPGetPromptResult,
 	MCPPrompt,
 	MCPRequestOptions,
@@ -65,13 +70,20 @@ import { MCPNotificationMethods } from "./types";
 export type McpCatalogChangeEvent = { serverName: string; kind: "resources" | "prompts" };
 export type MCPConfigLoader = (cwd: string, options?: LoadMCPConfigsOptions) => Promise<LoadMCPConfigsResult>;
 
+type OwnedAdmission = {
+	readonly config: MCPServerConfig;
+	readonly binding: MCPServerAdmission;
+	readonly abort: AbortController;
+	terminal?: MCPAdmissionError;
+};
+
 type ToolLoadResult = {
 	connection: MCPServerConnection;
 	serverTools: MCPToolDefinition[];
 };
 
 interface AuthRefreshableMCPTransport extends MCPTransport {
-	onAuthError?: () => Promise<Record<string, string> | null>;
+	onAuthError?: (signal?: AbortSignal) => Promise<Record<string, string> | null>;
 }
 
 function isAuthRefreshableMCPTransport(transport: MCPTransport): transport is AuthRefreshableMCPTransport {
@@ -351,12 +363,157 @@ export class MCPManager {
 	 */
 	#lostRemoteServers = new Map<string, { timer: NodeJS.Timeout | undefined; delayMs: number }>();
 
+	#admissions?: Map<string, OwnedAdmission>;
+
 	constructor(
 		private cwd: string,
 		private toolCache: MCPToolCache | null = null,
 		private loadConfigs: MCPConfigLoader = loadAllMCPConfigs,
 		private reconnectPolicy: MCPReconnectPolicy = DEFAULT_RECONNECT_POLICY,
-	) {}
+		private admission?: MCPManagerAdmission,
+	) {
+		if (admission) this.#admissions = new Map();
+	}
+
+	#stopAdmission(name: string, discard = true): MCPAdmissionError {
+		const owned = this.#admissions?.get(name);
+		if (owned?.terminal) return owned.terminal;
+		const error = new MCPAdmissionError();
+		if (owned) {
+			owned.terminal = error;
+			owned.abort.abort(error);
+		}
+		this.#forgetLostServer(name);
+		const connection = this.#connections.get(name);
+		if (connection && discard) {
+			if (isAuthRefreshableMCPTransport(connection.transport)) connection.transport.onAuthError = undefined;
+			this.#detachConnection(name, connection);
+			void disconnectServer(connection).catch(() => {});
+		}
+		return error;
+	}
+
+	#checkAdmission(name: string, owned = this.#admissions?.get(name), signal?: AbortSignal): void {
+		if (!this.admission) return;
+		if (!owned || this.#admissions?.get(name) !== owned || owned.terminal || owned.binding.signal.aborted) {
+			throw this.#stopAdmission(name);
+		}
+		signal?.throwIfAborted();
+	}
+
+	#captureAdmission(name: string, config: MCPServerConfig): OwnedAdmission | undefined {
+		if (!this.admission) return undefined;
+		const existing = this.#admissions?.get(name);
+		if (existing) {
+			this.#checkAdmission(name, existing);
+			if (existing.config !== config) throw this.#stopAdmission(name);
+			return existing;
+		}
+		const abort = new AbortController();
+		// Snapshot trusted runtime hooks once; never reacquire a revoked source binding.
+		let supplied: MCPServerAdmission;
+		try {
+			supplied = this.admission(name, config);
+		} catch {
+			const error = new MCPAdmissionError();
+			const owned: OwnedAdmission = {
+				config,
+				abort,
+				binding: Object.freeze({
+					signal: abort.signal,
+					beforeAuth: () => {
+						throw error;
+					},
+					transportOptions: Object.freeze({}),
+				}),
+			};
+			this.#admissions!.set(name, owned);
+			throw this.#stopAdmission(name);
+		}
+		const signal = AbortSignal.any([
+			supplied.signal,
+			...(supplied.transportOptions.signal ? [supplied.transportOptions.signal] : []),
+			abort.signal,
+		]);
+		const beforeSend = supplied.transportOptions.beforeSend;
+		const beforeSpawn = supplied.transportOptions.beforeSpawn;
+		const binding: MCPServerAdmission = Object.freeze({
+			signal,
+			beforeAuth: supplied.beforeAuth,
+			transportOptions: Object.freeze({
+				...supplied.transportOptions,
+				signal,
+				...(beforeSend
+					? {
+							beforeSend: async (event: Parameters<typeof beforeSend>[0]) => {
+								try {
+									await runMCPAdmission(event.signal, () => beforeSend(event));
+								} catch (error) {
+									if (isMCPAdmissionError(error)) throw this.#stopAdmission(name);
+									throw error;
+								}
+							},
+						}
+					: {}),
+				...(beforeSpawn
+					? {
+							beforeSpawn: async (event: Parameters<typeof beforeSpawn>[0]) => {
+								try {
+									await runMCPAdmission(event.signal, () => beforeSpawn(event));
+								} catch (error) {
+									if (isMCPAdmissionError(error)) throw this.#stopAdmission(name);
+									throw error;
+								}
+							},
+						}
+					: {}),
+			}),
+		});
+		const owned: OwnedAdmission = { config, binding, abort };
+		this.#admissions!.set(name, owned);
+		signal.addEventListener(
+			"abort",
+			() => {
+				this.#stopAdmission(name);
+			},
+			{ once: true },
+		);
+		this.#checkAdmission(name, owned);
+		return owned;
+	}
+
+	#prepareAdmitted(
+		name: string,
+		config: MCPServerConfig,
+		phase: MCPBeforeAuthEvent["phase"],
+		opts?: { forceRefresh?: boolean; oauth?: boolean; signal?: AbortSignal },
+	): Promise<MCPServerConfig> {
+		if (!this.admission) return this.#resolveAuthConfig(config, opts);
+		return this.#prepareGuarded(name, config, phase, opts);
+	}
+
+	async #prepareGuarded(
+		name: string,
+		config: MCPServerConfig,
+		phase: MCPBeforeAuthEvent["phase"],
+		opts?: { forceRefresh?: boolean; oauth?: boolean; signal?: AbortSignal },
+	): Promise<MCPServerConfig> {
+		const owned = this.#admissions?.get(name);
+		this.#checkAdmission(name, owned);
+		const signal = AbortSignal.any([owned!.binding.signal, opts?.signal ?? this.#connectAbort.signal]);
+		try {
+			await runMCPAdmission(signal, () => owned!.binding.beforeAuth({ phase, signal }));
+			this.#checkAdmission(name, owned, signal);
+			const resolved = await this.#resolveAuthConfig(config, { ...opts, signal });
+			this.#checkAdmission(name, owned, signal);
+			return resolved.type === "http" || resolved.type === "sse"
+				? { ...resolved, headerPolicy: "origin-locked" }
+				: resolved;
+		} catch (error) {
+			if (isMCPAdmissionError(error) || owned!.binding.signal.aborted) throw this.#stopAdmission(name);
+			throw error;
+		}
+	}
 
 	/**
 	 * Register a listener for MCP connection lifecycle events
@@ -844,13 +1001,20 @@ export class MCPManager {
 			this.#forgetLostServer(name);
 			this.#serverConfigs.set(name, config);
 			const connectionEpoch = this.#epoch;
-			const connectSignal = this.#connectAbort.signal;
+			let owned: OwnedAdmission | undefined;
+			const operationSignal = this.#connectAbort.signal;
+			const connectSignal = operationSignal;
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
-				const resolvedConfig = await this.#resolveAuthConfig(config, { signal: connectSignal });
+				owned = this.#captureAdmission(name, config);
+				const resolvedConfig = await this.#prepareAdmitted(name, config, "initial", { signal: operationSignal });
+				this.#checkAdmission(name, owned, operationSignal);
+				if (owned && (this.#epoch !== connectionEpoch || this.#serverConfigs.get(name) !== config))
+					throw this.#stopAdmission(name);
 				return connectToServer(name, resolvedConfig, {
-					signal: connectSignal,
+					signal: owned ? AbortSignal.any([connectSignal, owned.binding.signal]) : connectSignal,
+					...(owned ? { transportOptions: owned.binding.transportOptions } : undefined),
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
 					},
@@ -867,7 +1031,11 @@ export class MCPManager {
 						connection._source = sources[name];
 					}
 
-					if (this.#epoch !== connectionEpoch || this.#pendingConnections.get(name) !== connectionPromise) {
+					if (
+						owned?.binding.signal.aborted ||
+						this.#epoch !== connectionEpoch ||
+						this.#pendingConnections.get(name) !== connectionPromise
+					) {
 						this.#detachConnection(name, connection);
 						void disconnectServer(connection).catch(() => {});
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
@@ -885,8 +1053,11 @@ export class MCPManager {
 						isAuthRefreshableMCPTransport(connection.transport) &&
 						lookupMcpOAuthCredential(this.#authStorage, config)
 					) {
-						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+						connection.transport.onAuthError = async signal => {
+							const refreshed = await this.#prepareAdmitted(name, config, "auth-refresh", {
+								forceRefresh: true,
+								signal,
+							});
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -897,14 +1068,16 @@ export class MCPManager {
 					// Re-establish connection if the transport closes (server restart,
 					// network interruption).
 					connection.transport.onClose = () => {
+						if (owned?.binding.signal.aborted) return;
 						logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
 						this.#emitConnectionStatus({ type: "reconnecting", serverName: name });
-						void this.reconnectServer(name);
+						void this.reconnectServer(name).catch(() => {});
 					};
 
 					return connection;
 				},
 				error => {
+					if (isMCPAdmissionError(error) && this.admission) this.#stopAdmission(name);
 					if (this.#pendingConnections.get(name) === connectionPromise) {
 						this.#pendingConnections.delete(name);
 					}
@@ -916,6 +1089,7 @@ export class MCPManager {
 			const toolsPromise = connectionPromise.then(async connection => {
 				try {
 					const serverTools = await listTools(connection);
+					this.#checkAdmission(name, owned, operationSignal);
 					return { connection, serverTools };
 				} catch (error) {
 					// Detach and delete synchronously, then close in the background:
@@ -948,6 +1122,7 @@ export class MCPManager {
 					void this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
+					if (isMCPAdmissionError(error) && this.admission) this.#stopAdmission(name);
 					// disconnectAll aborted this handshake: torn down, not failed.
 					if (isAbortedHandshake(connectSignal, error) || this.#pendingToolLoads.get(name) !== toolsPromise)
 						return;
@@ -1265,6 +1440,7 @@ export class MCPManager {
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
+		this.#checkAdmission(name);
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
@@ -1309,8 +1485,14 @@ export class MCPManager {
 	 * Pass `oauth: false` to skip OAuth credential injection (used by reauth's
 	 * unauthenticated probe, which must observe the server's bare 401).
 	 */
-	async prepareConfig(config: MCPServerConfig, options?: { oauth?: boolean }): Promise<MCPServerConfig> {
-		return this.#resolveAuthConfig(config, options);
+	async prepareConfig(
+		config: MCPServerConfig,
+		options?: { oauth?: boolean; serverName?: string; signal?: AbortSignal },
+	): Promise<MCPServerConfig> {
+		if (!this.admission) return this.#resolveAuthConfig(config, options);
+		const name = options?.serverName;
+		if (!name || this.#admissions?.get(name)?.config !== config) throw new MCPAdmissionError();
+		return this.#prepareAdmitted(name, config, "prepare", options);
 	}
 
 	/**
@@ -1361,6 +1543,7 @@ export class MCPManager {
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		if (this.#admissions?.has(name)) this.#stopAdmission(name, false);
 		this.#startupServers.delete(name);
 		this.#startupFailures.delete(name);
 		this.#startupUpdates.delete(name);
@@ -1408,6 +1591,7 @@ export class MCPManager {
 		// handshakes still in flight too: a stalled one would otherwise keep its
 		// transport (and a stdio child) alive until its own timeout, or forever.
 		this.#epoch++;
+		if (this.#admissions) for (const name of this.#admissions.keys()) this.#stopAdmission(name, false);
 		this.#connectAbort.abort();
 		this.#connectAbort = new AbortController();
 		for (const name of this.#lostRemoteServers.keys()) this.#forgetLostServer(name);
@@ -1449,6 +1633,7 @@ export class MCPManager {
 		name: string,
 		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge },
 	): Promise<MCPServerConnection | null> {
+		this.#checkAdmission(name);
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
 		}
@@ -1483,6 +1668,8 @@ export class MCPManager {
 					return connection;
 				},
 				error => {
+					if (isMCPAdmissionError(error) || this.#admissions?.get(name)?.binding.signal.aborted)
+						throw this.#stopAdmission(name);
 					if (this.#lostRemoteServers.has(name)) this.#scheduleLostServerRetry(name);
 					throw error;
 				},
@@ -1496,6 +1683,10 @@ export class MCPManager {
 	 * down, and that reconnect's outcome settles the schedule instead.
 	 */
 	#scheduleLostServerRetry(name: string): void {
+		if (this.#admissions?.get(name)?.binding.signal.aborted) {
+			this.#stopAdmission(name);
+			return;
+		}
 		const state = this.#lostRemoteServers.get(name);
 		if (!state) return;
 		clearTimeout(state.timer);
@@ -1504,7 +1695,7 @@ export class MCPManager {
 		state.timer = setTimeout(() => {
 			state.timer = undefined;
 			if (this.#lostRemoteServers.get(name) !== state || this.#pendingReconnections.has(name)) return;
-			void this.#trackReconnect(name, this.#doReconnect(name, { scheduled: true }));
+			void this.#trackReconnect(name, this.#doReconnect(name, { scheduled: true })).catch(() => {});
 		}, delayMs);
 		state.timer.unref();
 		logger.debug("MCP reconnect scheduled", { path: `mcp:${name}`, delayMs });
@@ -1567,6 +1758,19 @@ export class MCPManager {
 		options: { authChallenge?: MCPAuthChallenge; scheduled?: boolean },
 	): Promise<MCPServerConnection | null> {
 		const { authChallenge, scheduled = false } = options;
+		this.#checkAdmission(name);
+		const challengeEpoch = this.#epoch;
+		const reconnectOwner = this.#admissions?.get(name);
+		if (reconnectOwner && !authChallenge) {
+			const signal = AbortSignal.any([reconnectOwner.binding.signal, this.#connectAbort.signal]);
+			try {
+				await runMCPAdmission(signal, () => reconnectOwner.binding.beforeAuth({ phase: "reconnect", signal }));
+				this.#checkAdmission(name, reconnectOwner, signal);
+			} catch (error) {
+				if (isMCPAdmissionError(error) || reconnectOwner.binding.signal.aborted) throw this.#stopAdmission(name);
+				throw error;
+			}
+		}
 		const oldConnection = this.#connections.get(name);
 		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
@@ -1580,11 +1784,26 @@ export class MCPManager {
 				return null;
 			}
 			try {
-				const refreshedConfig = await this.#authHandler(name, authChallenge);
+				const owned = this.#admissions?.get(name);
+				const signal = owned
+					? AbortSignal.any([owned.binding.signal, this.#connectAbort.signal])
+					: this.#connectAbort.signal;
+				if (owned) {
+					await runMCPAdmission(signal, () => owned.binding.beforeAuth({ phase: "auth-refresh", signal }));
+					this.#checkAdmission(name, owned, signal);
+				}
+				const refreshedConfig = owned
+					? await untilAborted(signal, () => this.#authHandler!(name, authChallenge))
+					: await this.#authHandler(name, authChallenge);
+				this.#checkAdmission(name, owned, signal);
+				if (this.admission && (this.#epoch !== challengeEpoch || this.#serverConfigs.get(name) !== config))
+					return null;
 				if (!refreshedConfig) return null;
 				config = refreshedConfig;
 				this.#serverConfigs.set(name, config);
 			} catch (error) {
+				if (isMCPAdmissionError(error) || this.#admissions?.get(name)?.binding.signal.aborted)
+					throw this.#stopAdmission(name);
 				logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
 				return null;
 			}
@@ -1630,6 +1849,8 @@ export class MCPManager {
 				this.#emitConnectionStatus({ type: "connected", serverName: name });
 				return connection;
 			} catch (error) {
+				if (isMCPAdmissionError(error) || this.#admissions?.get(name)?.binding.signal.aborted)
+					throw this.#stopAdmission(name);
 				if (this.#epoch !== reconnectEpoch || this.#serverConfigs.get(name) !== config) {
 					logger.debug("MCP reconnect aborted after configuration changed", {
 						path: `mcp:${name}`,
@@ -1671,10 +1892,18 @@ export class MCPManager {
 		reconnectEpoch: number,
 	): Promise<MCPServerConnection> {
 		// Capture before resolving credentials: a disconnectAll during that wait must abort this handshake too.
-		const connectSignal = this.#connectAbort.signal;
-		const resolvedConfig = await this.#resolveAuthConfig(config, { signal: connectSignal });
+		const owned = this.#admissions?.get(name);
+		this.#checkAdmission(name, owned);
+		const connectSignal = owned
+			? AbortSignal.any([this.#connectAbort.signal, owned.binding.signal])
+			: this.#connectAbort.signal;
+		const resolvedConfig = await this.#prepareAdmitted(name, config, "reconnect", { signal: connectSignal });
+		this.#checkAdmission(name, owned, connectSignal);
+		if (this.admission && (this.#serverConfigs.get(name) !== config || this.#epoch !== reconnectEpoch))
+			throw new MCPAdmissionError();
 		const connection = await connectToServer(name, resolvedConfig, {
 			signal: connectSignal,
+			...(owned ? { transportOptions: owned.binding.transportOptions } : undefined),
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
 			},
@@ -1699,8 +1928,8 @@ export class MCPManager {
 		// Wire auth refresh for HTTP-like transports, and reconnect for any transport.
 		// Same gate as connectServers: any resolvable managed credential.
 		if (isAuthRefreshableMCPTransport(connection.transport) && lookupMcpOAuthCredential(this.#authStorage, config)) {
-			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, { forceRefresh: true });
+			connection.transport.onAuthError = async signal => {
+				const refreshed = await this.#prepareAdmitted(name, config, "auth-refresh", { forceRefresh: true, signal });
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -1708,12 +1937,14 @@ export class MCPManager {
 			};
 		}
 		connection.transport.onClose = () => {
+			if (owned?.binding.signal.aborted) return;
 			logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
 			this.#emitConnectionStatus({ type: "reconnecting", serverName: name });
-			void this.reconnectServer(name);
+			void this.reconnectServer(name).catch(() => {});
 		};
 		try {
 			const serverTools = await listTools(connection);
+			this.#checkAdmission(name, owned, connectSignal);
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);

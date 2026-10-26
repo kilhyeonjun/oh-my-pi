@@ -2,6 +2,6 @@
  * MCP transport exports.
  */
 
-export * from "./http";
+export { createHttpTransport, HttpTransport, resolveSSEConnectTimeoutMs } from "./http";
 export * from "./sse";
 export * from "./stdio";

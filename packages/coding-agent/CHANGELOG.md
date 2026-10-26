@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional trusted-runtime MCP admission for source-bound auth preparation, physical HTTP/SSE sends and stdio spawn/frames, with exact child-environment replacement, terminal denial, and abortable asynchronous gates. Existing callers are unchanged; this does not supply config-source policy or human approval. See [runtime lifecycle](../../docs/mcp-runtime-lifecycle.md#optional-trusted-runtime-admission) and [transport admission](../../docs/mcp-protocol-transports.md#optional-runtime-effect-admission).
+
 ## [18.11.3] - 2026-10-16
 
 ### Breaking Changes

@@ -36,6 +36,7 @@ import type {
 	MCPToolDefinition,
 	MCPToolsListResult,
 	MCPTransport,
+	MCPTransportOptions,
 } from "./types";
 
 import { MCP_PROTOCOL_VERSION } from "./types";
@@ -70,16 +71,24 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-async function createTransport(config: MCPServerConfig, signal?: AbortSignal): Promise<MCPTransport> {
+async function createTransport(
+	config: MCPServerConfig,
+	signal?: AbortSignal,
+	transportOptions?: MCPTransportOptions,
+): Promise<MCPTransport> {
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
 		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig);
+			return transportOptions
+				? createStdioTransport(config as MCPStdioServerConfig, transportOptions, signal)
+				: createStdioTransport(config as MCPStdioServerConfig);
 		case "http":
-			return createHttpTransport(config as MCPHttpServerConfig);
+			return transportOptions
+				? createHttpTransport(config as MCPHttpServerConfig, transportOptions, signal)
+				: createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
-			return createSseTransport(config as MCPSseServerConfig, signal);
+			return createSseTransport(config as MCPSseServerConfig, signal, transportOptions);
 		default:
 			throw new Error(`Unknown server type: ${serverType}`);
 	}
@@ -152,18 +161,48 @@ export async function connectToServer(
 	config: MCPServerConfig,
 	options?: {
 		signal?: AbortSignal;
+		transportOptions?: MCPTransportOptions;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
 ): Promise<MCPServerConnection> {
 	// `withTimeout` rejects a pre-aborted signal without observing `connect()`; never start one.
 	options?.signal?.throwIfAborted();
+	const transportOptions = options?.transportOptions;
+	transportOptions?.signal?.throwIfAborted();
+	const abandoned = transportOptions ? new AbortController() : undefined;
+	let signal = options?.signal;
+	if (abandoned) {
+		const signals = [abandoned.signal];
+		if (signal) signals.push(signal);
+		if (transportOptions?.signal) signals.push(transportOptions.signal);
+		signal = AbortSignal.any(signals);
+	}
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
 	const timeoutError = new MCPConnectionTimeoutError(name, timeoutMs);
 	let transport: MCPTransport | undefined;
+	let closing: Promise<void> | undefined;
+	const closeOwned = transportOptions
+		? () => {
+				if (!transport) return undefined;
+				closing ??= transport.close().catch(() => {
+					try {
+						transport?.onError?.(new Error("MCP connection cleanup is unconfirmed"));
+					} catch {
+						/* Preserve the primary failure. */
+					}
+					throw new Error("MCP connection cleanup is unconfirmed");
+				});
+				return closing;
+			}
+		: undefined;
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config, options?.signal);
+		transport = await createTransport(config, signal, transportOptions);
+		if (transportOptions && signal?.aborted) {
+			await closeOwned?.()?.catch(() => {});
+			signal.throwIfAborted();
+		}
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}
@@ -175,7 +214,7 @@ export async function connectToServer(
 
 		try {
 			const initResult = await initializeConnection(transport, {
-				signal: options?.signal,
+				signal,
 				async onInitialized() {
 					// Open the optional GET SSE stream only after the initialized
 					// notification makes the session ready for further traffic.
@@ -185,6 +224,7 @@ export async function connectToServer(
 				},
 			});
 
+			if (transportOptions) signal?.throwIfAborted();
 			return {
 				name,
 				config,
@@ -194,7 +234,8 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			if (closeOwned) await closeOwned()?.catch(() => {});
+			else await transport.close();
 			throw error;
 		}
 	};
@@ -203,14 +244,15 @@ export async function connectToServer(
 		// Race the whole handshake against the signal: the steps after `initialize` (the
 		// initialized notification, the SSE listener) do not observe it themselves.
 		if (!isMCPTimeoutEnabled(timeoutMs)) {
-			return await untilAborted(options?.signal, connect());
+			return await untilAborted(signal, connect());
 		}
-		return await withTimeout(connect(), timeoutMs, timeoutError, options?.signal);
+		return await withTimeout(connect(), timeoutMs, timeoutError, signal);
 	} catch (error) {
-		// If the timeout or the signal won while connect() was still pending,
-		// the transport may be alive with an open SSE listener. Close it.
+		// Factories retain late instances; revocation prevents a late spawn/send.
+		abandoned?.abort(error);
 		if (transport) {
-			void transport.close().catch(() => {});
+			if (closeOwned) await closeOwned()?.catch(() => {});
+			else void transport.close().catch(() => {});
 		}
 		throw error instanceof LegacySseConnectionTimeoutError ? timeoutError : error;
 	}

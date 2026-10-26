@@ -10,6 +10,8 @@ export * from "./client";
 // Config
 export * from "./config";
 export * from "./config-writer";
+// Source-owned terminal admission identity (never reconstructed from remote codes).
+export { MCPAdmissionError, isMCPAdmissionError } from "./errors";
 // JSON-RPC (lightweight HTTP-based MCP calls)
 export * from "./json-rpc";
 // Loader (for SDK integration)
@@ -23,7 +25,7 @@ export * from "./tool-bridge";
 // Tool cache
 export * from "./tool-cache";
 // Transports
-export * from "./transports/http";
+export { createHttpTransport, HttpTransport, resolveSSEConnectTimeoutMs } from "./transports/http";
 export * from "./transports/stdio";
 // Types
 export * from "./types";

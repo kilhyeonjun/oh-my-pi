@@ -9,6 +9,7 @@ export type MCPFailureStage = "connect" | "send" | "receive" | "decode" | "proto
 
 /** Stable failure classes exposed in MCP tool diagnostics. */
 export type MCPFailureClass =
+	| "admission"
 	| "connect"
 	| "timeout"
 	| "eof"
@@ -76,6 +77,27 @@ export class MCPTransportError extends Error {
 		this.data = options.data;
 		this.traceId = options.traceId;
 	}
+}
+
+/** Terminal trusted-runtime denial; remote text or JSON codes never create this identity. */
+export class MCPAdmissionError extends MCPTransportError {
+	declare readonly failure: "admission";
+
+	constructor() {
+		super({
+			transport: "unknown",
+			stage: "send",
+			failure: "admission",
+			message: "MCP operation is not admitted by the current owner",
+			retryable: false,
+			code: "MCP_ADMISSION_DENIED",
+		});
+		this.name = "MCPAdmissionError";
+	}
+}
+
+export function isMCPAdmissionError(error: unknown): error is MCPAdmissionError {
+	return error instanceof MCPAdmissionError;
 }
 
 function errorCode(error: unknown): string | number | undefined {
@@ -247,6 +269,8 @@ export function normalizeMCPTransportError(
 
 function nextStep(error: MCPTransportError): string {
 	switch (error.failure) {
+		case "admission":
+			return "The current owner did not admit this operation; do not automatically retry.";
 		case "connect":
 			return "Check that the MCP server is running and reachable, then retry.";
 		case "timeout":

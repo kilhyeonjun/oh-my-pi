@@ -13,6 +13,11 @@
  *    origin. Method-changing redirects of non-GET requests are refused.
  */
 
+import { runMCPAdmission } from "../admission";
+import { MCPAdmissionError } from "../errors";
+import { getNeverAbortSignal } from "../timeout";
+import type { MCPTransportOptions } from "../types";
+
 /** Header buckets for one MCP HTTP request. */
 interface MCPHeaderSources {
 	/** Client-generated HTTP/MCP/authorization headers; win case-insensitively. */
@@ -106,8 +111,20 @@ export async function mcpFetch(
 	init: MCPFetchInit,
 	sources: MCPHeaderSources,
 	originLocked: boolean,
+	options?: MCPTransportOptions,
+	transport: "http" | "sse" = "http",
+	onCallback?: (pending: boolean) => void,
+	onSend?: () => void,
 ): Promise<Response> {
+	const beforeSend = options?.beforeSend;
+	if (beforeSend && !originLocked) throw new MCPAdmissionError();
+	// Only guarded sends snapshot the wire fields; strings are already serialized.
+	if (beforeSend) init = Object.freeze({ method: init.method, body: init.body, signal: init.signal });
 	if (!originLocked) {
+		if (onSend) {
+			init.signal?.throwIfAborted();
+			onSend();
+		}
 		return fetch(url, { ...init, headers: mergeMCPHeaders(sources), timeout: false });
 	}
 
@@ -116,6 +133,23 @@ export async function mcpFetch(
 	for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
 		const attachConfigured = new URL(currentUrl).origin === configuredOrigin;
 		const headers = mergeMCPHeaders(attachConfigured ? sources : { generated: sources.generated });
+		if (beforeSend) {
+			const signal = init.signal ?? getNeverAbortSignal();
+			const event = Object.freeze({ transport, url: currentUrl, method: init.method, body: init.body, signal });
+			await runMCPAdmission(signal, async () => {
+				onCallback?.(true);
+				try {
+					return await beforeSend(event);
+				} finally {
+					onCallback?.(false);
+				}
+			});
+			signal.throwIfAborted();
+		}
+		if (onSend) {
+			if (!beforeSend) init.signal?.throwIfAborted();
+			onSend();
+		}
 		const response = await fetch(currentUrl, { ...init, headers, redirect: "manual", timeout: false });
 		if (!REDIRECT_STATUSES[response.status]) return response;
 
@@ -127,5 +161,7 @@ export async function mcpFetch(
 		}
 		currentUrl = new URL(location, currentUrl).href;
 	}
-	throw new Error(`Too many redirects (> ${MAX_REDIRECT_HOPS}) fetching ${url}`);
+	throw new Error(
+		beforeSend ? "Too many MCP redirects" : `Too many redirects (> ${MAX_REDIRECT_HOPS}) fetching ${url}`,
+	);
 }

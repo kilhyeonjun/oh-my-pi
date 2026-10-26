@@ -7,6 +7,7 @@
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { withTimeoutSignal } from "../utils/fetch-timeout";
+import { getMCPHttpAuthError } from "./transports/http";
 
 /** Per-request abort deadline for each OAuth discovery metadata fetch. */
 const DISCOVERY_FETCH_TIMEOUT_MS = 10_000;
@@ -239,6 +240,8 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
  * Returns structured info about what auth is needed.
  */
 export function analyzeAuthError(error: Error, serverUrl?: string): AuthDetectionResult {
+	// Guarded transports keep the original challenge in native-only custody.
+	error = getMCPHttpAuthError(error);
 	// No auth required unless the error carries an HTTP auth status / auth-failure phrasing.
 	if (!AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)) {
 		return { requiresAuth: false };

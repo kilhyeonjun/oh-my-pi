@@ -15,10 +15,13 @@ import type {
 	MCPRequestOptions,
 	MCPSseServerConfig,
 	MCPTransport,
+	MCPTransportOptions,
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
 import {
 	createMCPJsonRpcError,
+	isMCPAdmissionError,
+	MCPAdmissionError,
 	type MCPFailureStage,
 	MCPTransportError,
 	mcpTraceIdFromHeaders,
@@ -36,6 +39,20 @@ import { type MCPFetchInit, mcpFetch, withoutHeader } from "./header-policy";
 
 const HTTP_SSE_CONNECT_TIMEOUT_MS = 1_000;
 const DEFAULT_SSE_RETRY_MS = 3_000;
+
+// Native OAuth discovery parses challenge hints from an Error message. Keep that
+// input out of the public diagnostic error rather than changing its decoder.
+let guardedAuthChallenges: WeakMap<Error, Error> | undefined;
+/** Internal native auth input only; never log or expose the returned challenge. */
+export function getMCPHttpAuthError(error: Error): Error {
+	return guardedAuthChallenges?.get(error) ?? error;
+}
+
+interface GuardedRequestOperation {
+	operation: MCPTimeoutOperation;
+	timeout: number;
+	releaseCaller?: () => void;
+}
 
 interface SSEResumeState {
 	lastEventId: string | null;
@@ -91,6 +108,8 @@ export class HttpTransport implements MCPTransport {
 	readonly #activeFetches = new Set<Promise<Response>>();
 	readonly #backgroundDrains = new Set<Promise<void>>();
 	#closePromise: Promise<void> | null = null;
+	#pendingAdmissions = 0;
+	readonly #observeAdmission?: (pending: boolean) => void;
 	/**
 	 * Protocol version echoed in the `MCP-Protocol-Version` header. `null` until
 	 * the `initialize` response is negotiated (via {@link setProtocolVersion}):
@@ -105,9 +124,57 @@ export class HttpTransport implements MCPTransport {
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	/** Called on 401/403 to attempt token refresh. Returns updated headers or null. */
-	onAuthError?: () => Promise<Record<string, string> | null>;
+	onAuthError?: (signal?: AbortSignal) => Promise<Record<string, string> | null>;
 
-	constructor(private config: MCPHttpServerConfig | MCPSseServerConfig) {}
+	constructor(
+		private config: MCPHttpServerConfig | MCPSseServerConfig,
+		private readonly transportOptions?: MCPTransportOptions,
+		private readonly connectSignal?: AbortSignal,
+	) {
+		if (transportOptions?.beforeSend && config.headerPolicy !== "origin-locked") throw new MCPAdmissionError();
+		if (transportOptions?.beforeSend) {
+			this.transportOptions = Object.freeze({
+				beforeSend: transportOptions.beforeSend,
+				signal: transportOptions.signal,
+			});
+			this.#observeAdmission = pending => {
+				this.#pendingAdmissions += pending ? 1 : -1;
+			};
+		}
+	}
+
+	#awaitAuthRefresh(signal: AbortSignal | undefined, refresh: () => Promise<Record<string, string> | null>) {
+		const waiting = untilAborted(signal, refresh);
+		if (!this.transportOptions?.beforeSend) return waiting;
+		return waiting.catch(error => {
+			if (isMCPAdmissionError(error)) throw error;
+			const owner = this.transportOptions?.signal;
+			if (owner?.aborted && isMCPAdmissionError(owner.reason)) throw owner.reason;
+			if (signal?.aborted && isMCPAdmissionError(signal.reason)) throw signal.reason;
+			throw error;
+		});
+	}
+
+	/** Guarded diagnostics never retain server echoes, URLs or exception causes. */
+	#safeError(error: unknown): Error {
+		if (!this.transportOptions?.beforeSend || isMCPAdmissionError(error) || error instanceof MCPTransportError)
+			return error instanceof Error ? error : new Error(String(error));
+		return new Error("MCP HTTP operation failed");
+	}
+
+	#normalizeError(error: unknown, stage: MCPFailureStage, traceId?: string): MCPTransportError {
+		const normalized = normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+		if (!this.transportOptions?.beforeSend || isMCPAdmissionError(normalized) || error instanceof MCPTransportError)
+			return normalized;
+		return new MCPTransportError({
+			transport: "http",
+			stage: normalized.stage,
+			failure: normalized.failure,
+			message: "MCP HTTP operation failed",
+			retryable: normalized.retryable,
+			code: typeof normalized.code === "number" ? normalized.code : undefined,
+		});
+	}
 
 	/**
 	 * Fetch the configured endpoint with header precedence and origin policy.
@@ -127,6 +194,9 @@ export class HttpTransport implements MCPTransport {
 			init,
 			{ generated: withVersion, configured },
 			this.config.headerPolicy === "origin-locked",
+			this.transportOptions,
+			"http",
+			this.#observeAdmission,
 		);
 		this.#activeFetches.add(request);
 		void request.then(
@@ -138,6 +208,11 @@ export class HttpTransport implements MCPTransport {
 
 	/** Combine caller cancellation with transport shutdown for every HTTP operation. */
 	#operationSignal(signal?: AbortSignal): AbortSignal {
+		const owner = this.transportOptions?.signal;
+		if (owner)
+			return AbortSignal.any(
+				signal ? [signal, owner, this.#lifecycleController.signal] : [owner, this.#lifecycleController.signal],
+			);
 		return signal ? AbortSignal.any([signal, this.#lifecycleController.signal]) : this.#lifecycleController.signal;
 	}
 
@@ -160,8 +235,8 @@ export class HttpTransport implements MCPTransport {
 		const handled = drain.catch(error => {
 			if (error instanceof Error && error.name === "AbortError") return;
 			logger.debug("MCP HTTP background drain failed", {
-				url: this.config.url,
-				error: error instanceof Error ? error.message : String(error),
+				url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+				error: this.#safeError(error).message,
 			});
 		});
 		this.#backgroundDrains.add(handled);
@@ -189,6 +264,8 @@ export class HttpTransport implements MCPTransport {
 	 * HTTP doesn't need persistent connection, but we track state.
 	 */
 	async connect(): Promise<void> {
+		this.connectSignal?.throwIfAborted();
+		this.transportOptions?.signal?.throwIfAborted();
 		if (this.#connected) return;
 		if (this.#closePromise) await this.#closePromise;
 		if (this.#lifecycleController.signal.aborted) {
@@ -221,7 +298,16 @@ export class HttpTransport implements MCPTransport {
 		let startupFinished = false;
 		const connection = this.#sseConnection;
 		const startupTimeoutMs = resolveSSEConnectTimeoutMs(this.config.timeout);
-		const fetchPromise = this.#fetch({ method: "GET", signal: connection.signal }, generated);
+		const fetchPromise = this.#fetch(
+			{
+				method: "GET",
+				signal:
+					this.transportOptions?.beforeSend || this.transportOptions?.signal
+						? this.#operationSignal(connection.signal)
+						: connection.signal,
+			},
+			generated,
+		);
 		const timeoutPromise =
 			startupTimeoutMs > 0
 				? new Promise<null>(resolve => {
@@ -238,8 +324,10 @@ export class HttpTransport implements MCPTransport {
 			response = timeoutPromise === null ? await fetchPromise : await Promise.race([fetchPromise, timeoutPromise]);
 		} catch (error) {
 			if (this.#sseConnection === connection) this.#sseConnection = null;
+			if (isMCPAdmissionError(error)) throw error;
+			if (this.transportOptions?.beforeSend && !timedOut && this.#operationSignal().aborted) throw error;
 			if (error instanceof Error && error.name !== "AbortError" && !timedOut) {
-				this.onError?.(error);
+				this.onError?.(this.#safeError(error));
 			}
 			return;
 		} finally {
@@ -264,7 +352,7 @@ export class HttpTransport implements MCPTransport {
 		// Connection established — read messages in background.
 		// If the stream ends unexpectedly (server restart, network drop),
 		// fire onClose so the manager can trigger reconnection.
-		const signal = connection.signal;
+		const signal = this.transportOptions?.beforeSend ? this.#operationSignal(connection.signal) : connection.signal;
 		this.#trackBackgroundDrain(
 			this.#runSSEListener(response.body, signal).finally(() => {
 				const wasConnected = this.#connected;
@@ -281,8 +369,11 @@ export class HttpTransport implements MCPTransport {
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.config.url, error: error.message });
-				this.onError?.(error);
+				logger.debug("HTTP SSE stream error", {
+					url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+					error: this.#safeError(error).message,
+				});
+				this.onError?.(this.#safeError(error));
 			}
 		}
 	}
@@ -312,11 +403,11 @@ export class HttpTransport implements MCPTransport {
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") return;
 				logger.debug("HTTP SSE stream error", {
-					url: this.config.url,
-					error: error instanceof Error ? error.message : String(error),
+					url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+					error: this.#safeError(error).message,
 				});
 				if (resume.lastEventId === null) {
-					if (error instanceof Error) this.onError?.(error);
+					if (error instanceof Error) this.onError?.(this.#safeError(error));
 					return;
 				}
 			}
@@ -326,10 +417,15 @@ export class HttpTransport implements MCPTransport {
 				const response = await this.#fetchSSEResume(resume, signal);
 				body = response.body as ReadableStream<Uint8Array>;
 			} catch (error) {
+				if (isMCPAdmissionError(error)) {
+					this.onClose = undefined;
+					this.onError?.(error);
+					return;
+				}
 				if (!(error instanceof Error && error.name === "AbortError")) {
 					logger.debug("HTTP SSE listener resume failed", {
-						url: this.config.url,
-						error: error instanceof Error ? error.message : String(error),
+						url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+						error: this.#safeError(error).message,
 					});
 				}
 				return;
@@ -357,7 +453,10 @@ export class HttpTransport implements MCPTransport {
 		const refreshAuth = this.onAuthError;
 		if (refreshAuth && (response.status === 401 || response.status === 403)) {
 			await response.body?.cancel();
-			const newHeaders = await untilAborted(signal, () => refreshAuth.call(this));
+			const newHeaders = await this.#awaitAuthRefresh(signal, () =>
+				this.transportOptions?.beforeSend ? refreshAuth.call(this, signal) : refreshAuth.call(this),
+			);
+			if (this.transportOptions?.beforeSend) signal.throwIfAborted();
 			if (!newHeaders) {
 				throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: auth refresh failed`);
 			}
@@ -370,12 +469,20 @@ export class HttpTransport implements MCPTransport {
 				signal.throwIfAborted();
 				return "";
 			});
-			throw new SSEResumeError(`HTTP ${response.status} resuming MCP SSE stream: ${text}`);
+			throw new SSEResumeError(
+				this.transportOptions?.beforeSend
+					? `HTTP ${response.status} resuming MCP SSE stream`
+					: `HTTP ${response.status} resuming MCP SSE stream: ${text}`,
+			);
 		}
 		const contentType = response.headers.get("Content-Type") ?? "";
 		if (!contentType.includes("text/event-stream") || !response.body) {
 			await response.body?.cancel();
-			throw new SSEResumeError(`MCP SSE resume returned unsupported Content-Type: ${contentType || "(missing)"}`);
+			throw new SSEResumeError(
+				this.transportOptions?.beforeSend
+					? "MCP SSE resume returned unsupported Content-Type"
+					: `MCP SSE resume returned unsupported Content-Type: ${contentType || "(missing)"}`,
+			);
 		}
 		return response;
 	}
@@ -388,7 +495,13 @@ export class HttpTransport implements MCPTransport {
 		}
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			if (this.transportOptions?.beforeSend) {
+				this.#trackBackgroundDrain(
+					this.#handleServerRequest(message as JsonRpcRequest).catch(error => {
+						this.onError?.(this.#safeError(error));
+					}),
+				);
+			} else void this.#handleServerRequest(message as JsonRpcRequest);
 			return;
 		}
 		// Notification: has method but no id
@@ -398,7 +511,11 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T> {
-		return this.#trackRequest(this.#requestWithAuthRetry<T>(method, params, options));
+		return this.#trackRequest(
+			this.transportOptions?.beforeSend
+				? this.#requestWithAuthRetry<T>(method, params, options)
+				: this.#requestAttempts<T>(method, params, options),
+		);
 	}
 
 	async #requestWithAuthRetry<T>(
@@ -406,20 +523,78 @@ export class HttpTransport implements MCPTransport {
 		params: Record<string, unknown> | undefined,
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
+		// One native deadline covers admission, the first POST, native auth and
+		// replay. Detach caller cancellation at SSE capture, not at a 401.
+		let callerSignal: AbortSignal | undefined;
+		let releaseCaller: (() => void) | undefined;
+		if (options?.signal) {
+			const source = options.signal;
+			const controller = new AbortController();
+			const forwardAbort = (): void => controller.abort(source.reason);
+			if (source.aborted) forwardAbort();
+			else {
+				source.addEventListener("abort", forwardAbort, { once: true });
+				releaseCaller = () => source.removeEventListener("abort", forwardAbort);
+			}
+			callerSignal = controller.signal;
+		}
+		const timeout = resolveMCPTimeoutMs(this.config.timeout);
+		const operation = createMCPTimeout(timeout, this.#operationSignal(callerSignal));
 		try {
-			return await this.#executeRequest<T>(method, params, options);
+			return await this.#requestAttempts<T>(method, params, options, { operation, timeout, releaseCaller });
+		} catch (error) {
+			if (isMCPAdmissionError(error)) throw error;
+			if (operation.timedOut()) {
+				if (error instanceof MCPTransportError && error.failure === "timeout") throw error;
+				throw new MCPTransportError({
+					transport: "http",
+					stage: "send",
+					failure: "timeout",
+					message: `Request timeout after ${timeout}ms`,
+					retryable: false,
+				});
+			}
+			throw error;
+		} finally {
+			releaseCaller?.();
+			operation.clear();
+		}
+	}
+
+	async #requestAttempts<T>(
+		method: string,
+		params: Record<string, unknown> | undefined,
+		options: MCPRequestOptions | undefined,
+		logical?: GuardedRequestOperation,
+	): Promise<T> {
+		try {
+			return await this.#executeRequest<T>(method, params, options, logical);
 		} catch (error) {
 			// Retry once on auth failure if onAuthError is wired. Never replay
 			// after an SSE resume failure: the server already accepted the
 			// original POST and may have executed it — replaying could run a
 			// state-changing tool twice.
 			const status = error instanceof Error ? AIError.status(error) : undefined;
-			if (!(error instanceof SSEResumeError) && this.onAuthError && (status === 401 || status === 403)) {
-				const newHeaders = await this.onAuthError();
+			if (
+				!isMCPAdmissionError(error) &&
+				!(error instanceof SSEResumeError) &&
+				this.onAuthError &&
+				(status === 401 || status === 403)
+			) {
+				const refreshSignal = logical?.operation.signal;
+				const newHeaders = this.transportOptions?.beforeSend
+					? await this.#awaitAuthRefresh(refreshSignal, () => this.onAuthError!(refreshSignal)).catch(
+							refreshError => {
+								if (isMCPAdmissionError(refreshError) || refreshSignal?.aborted) throw refreshError;
+								throw this.#normalizeError(refreshError, "send");
+							},
+						)
+					: await this.onAuthError();
+				logical?.operation.signal?.throwIfAborted();
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
-					return this.#executeRequest<T>(method, params, options);
+					return this.#executeRequest<T>(method, params, options, logical);
 				}
 			}
 			throw error;
@@ -430,6 +605,7 @@ export class HttpTransport implements MCPTransport {
 		method: string,
 		params: Record<string, unknown> | undefined,
 		options: MCPRequestOptions | undefined,
+		logical?: GuardedRequestOperation,
 	): Promise<T> {
 		if (!this.#connected) {
 			throw new MCPTransportError({
@@ -461,8 +637,8 @@ export class HttpTransport implements MCPTransport {
 		// Caller cancellation owns this request only until its response arrives;
 		// transport cancellation must continue owning any subsequent SSE messages.
 		let callerSignal: AbortSignal | undefined;
-		let releaseCaller: (() => void) | undefined;
-		if (options?.signal) {
+		let releaseCaller = logical?.releaseCaller;
+		if (!logical && options?.signal) {
 			const source = options.signal;
 			const controller = new AbortController();
 			const forwardAbort = (): void => controller.abort(source.reason);
@@ -473,8 +649,8 @@ export class HttpTransport implements MCPTransport {
 			}
 			callerSignal = controller.signal;
 		}
-		const timeout = resolveMCPTimeoutMs(this.config.timeout);
-		const operation = createMCPTimeout(timeout, this.#operationSignal(callerSignal));
+		const timeout = logical?.timeout ?? resolveMCPTimeoutMs(this.config.timeout);
+		const operation = logical?.operation ?? createMCPTimeout(timeout, this.#operationSignal(callerSignal));
 		let stage: MCPFailureStage = "send";
 		let traceId: string | undefined;
 
@@ -484,7 +660,7 @@ export class HttpTransport implements MCPTransport {
 				generated,
 			);
 			stage = "receive";
-			traceId = mcpTraceIdFromHeaders(response.headers);
+			traceId = this.transportOptions?.beforeSend ? undefined : mcpTraceIdFromHeaders(response.headers);
 
 			// Check for session ID in response
 			const newSessionId = response.headers.get("Mcp-Session-Id");
@@ -503,15 +679,22 @@ export class HttpTransport implements MCPTransport {
 					.filter(Boolean)
 					.join("; ");
 				const suffix = authHints ? ` [${authHints}]` : "";
-				throw new MCPTransportError({
+				const failure = new MCPTransportError({
 					transport: "http",
 					stage,
 					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}${suffix}`,
+					message: this.transportOptions?.beforeSend
+						? `HTTP ${response.status}: MCP request failed`
+						: `HTTP ${response.status}: ${text}${suffix}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
 					code: response.status,
 					traceId,
 				});
+				if (this.transportOptions?.beforeSend && (response.status === 401 || response.status === 403)) {
+					guardedAuthChallenges ??= new WeakMap();
+					guardedAuthChallenges.set(failure, new Error(`HTTP ${response.status}: ${text}${suffix}`));
+				}
+				throw failure;
 			}
 
 			const contentType = response.headers.get("Content-Type") ?? "";
@@ -539,14 +722,17 @@ export class HttpTransport implements MCPTransport {
 				}
 				throw createMCPJsonRpcError(
 					"http",
-					{ code: result.error.code, message: result.error.message, data: result.error.data },
+					this.transportOptions?.beforeSend
+						? { code: result.error.code, message: "MCP server error" }
+						: { code: result.error.code, message: result.error.message, data: result.error.data },
 					traceId,
 				);
 			}
 
 			return result.result as T;
 		} catch (error) {
-			if (error instanceof SSEResumeError) throw error;
+			if (isMCPAdmissionError(error) || error instanceof SSEResumeError) throw error;
+			if (operation.signal?.aborted && !operation.timedOut()) throw error;
 			if (operation.isTimeoutAbort(error) || operation.timedOut()) {
 				throw new MCPTransportError({
 					transport: "http",
@@ -555,14 +741,16 @@ export class HttpTransport implements MCPTransport {
 					message: `Request timeout after ${timeout}ms`,
 					retryable: false,
 					traceId,
-					cause: error,
+					cause: this.transportOptions?.beforeSend ? undefined : error,
 				});
 			}
 			if (error instanceof Error && error.name === "AbortError") throw error;
-			throw normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			throw this.#normalizeError(error, stage, traceId);
 		} finally {
-			releaseCaller?.();
-			operation.clear();
+			if (!logical) {
+				releaseCaller?.();
+				operation.clear();
+			}
 		}
 	}
 
@@ -573,7 +761,7 @@ export class HttpTransport implements MCPTransport {
 		timeout: number,
 		releaseCaller?: () => void,
 	): Promise<T> {
-		const traceId = mcpTraceIdFromHeaders(response.headers);
+		const traceId = this.transportOptions?.beforeSend ? undefined : mcpTraceIdFromHeaders(response.headers);
 		if (!response.body) {
 			throw new MCPTransportError({
 				transport: "http",
@@ -617,12 +805,35 @@ export class HttpTransport implements MCPTransport {
 									message.id === expectedId &&
 									("result" in message || "error" in message)
 								) {
+									if (
+										this.transportOptions?.beforeSend &&
+										message.error !== undefined &&
+										(!isRecord(message.error) ||
+											!Number.isSafeInteger(message.error.code) ||
+											typeof message.error.message !== "string")
+									) {
+										throw new MCPTransportError({
+											transport: "http",
+											stage: "decode",
+											failure: "malformed_response",
+											message: "Malformed JSON-RPC error response",
+											retryable: false,
+										});
+									}
 									captured = true;
 									releaseCaller?.();
 									releaseCaller = undefined;
 									operation.clear();
 									if (message.error) {
-										reject(createMCPJsonRpcError("http", message.error, traceId));
+										reject(
+											createMCPJsonRpcError(
+												"http",
+												this.transportOptions?.beforeSend
+													? { code: message.error.code, message: "MCP server error" }
+													: message.error,
+												traceId,
+											),
+										);
 									} else {
 										resolve(message.result as T);
 									}
@@ -637,10 +848,15 @@ export class HttpTransport implements MCPTransport {
 						// resumable as a server-initiated close once an event ID
 						// exists; the request timeout still bounds the total wait.
 						if (captured) return;
-						if (signal.aborted || resume.lastEventId === null) throw error;
+						if (
+							signal.aborted ||
+							resume.lastEventId === null ||
+							(error instanceof MCPTransportError && error.failure === "malformed_response")
+						)
+							throw error;
 						logger.debug("MCP SSE response stream dropped; resuming", {
-							url: this.config.url,
-							error: error instanceof Error ? error.message : String(error),
+							url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+							error: this.#safeError(error).message,
 						});
 					}
 					if (captured) return;
@@ -668,7 +884,11 @@ export class HttpTransport implements MCPTransport {
 				// guard still fires instead of refreshing auth and re-POSTing, and
 				// force every other post-acceptance failure non-retryable so the
 				// reconnect path in isRetriableConnectionError cannot replay it.
-				if (error instanceof SSEResumeError) {
+				if (
+					isMCPAdmissionError(error) ||
+					error instanceof SSEResumeError ||
+					(signal.aborted && !operation.timedOut())
+				) {
 					reject(error);
 				} else if (operation.isTimeoutAbort(error) || operation.timedOut()) {
 					reject(
@@ -679,17 +899,17 @@ export class HttpTransport implements MCPTransport {
 							message: `SSE response timeout after ${timeout}ms`,
 							retryable: false,
 							traceId,
-							cause: error,
+							cause: this.transportOptions?.beforeSend ? undefined : error,
 						}),
 					);
 				} else if (error instanceof Error && error.name === "AbortError") {
 					reject(error);
 				} else {
-					const normalized = normalizeMCPTransportError(error, {
-						transport: "http",
-						stage: error instanceof SyntaxError ? "decode" : "receive",
+					const normalized = this.#normalizeError(
+						error,
+						error instanceof SyntaxError ? "decode" : "receive",
 						traceId,
-					});
+					);
 					reject(
 						normalized.retryable
 							? new MCPTransportError({
@@ -721,12 +941,18 @@ export class HttpTransport implements MCPTransport {
 			await this.#sendServerResponse(request.id, undefined, { code: -32601, message: "Method not found" });
 			return;
 		}
+		let result: unknown;
 		try {
-			const result = await this.onRequest(request.method, request.params);
-			await this.#sendServerResponse(request.id, result);
+			result = this.transportOptions?.beforeSend
+				? await untilAborted(this.#operationSignal(), () => this.onRequest!(request.method, request.params))
+				: await this.onRequest(request.method, request.params);
 		} catch (error) {
+			if (this.transportOptions?.beforeSend && (isMCPAdmissionError(error) || this.#operationSignal().aborted))
+				throw error;
 			await this.#sendServerResponse(request.id, undefined, toJsonRpcError(error));
+			return;
 		}
+		await this.#sendServerResponse(request.id, result);
 	}
 
 	/** POST a JSON-RPC response back to the server (for server-to-client requests received via SSE). */
@@ -750,12 +976,16 @@ export class HttpTransport implements MCPTransport {
 			// Retry once on auth failure if onAuthError is wired
 			if (this.onAuthError && (resp.status === 401 || resp.status === 403)) {
 				await resp.body?.cancel();
-				const newHeaders = await this.onAuthError();
+				const newHeaders = this.transportOptions?.beforeSend
+					? await this.#awaitAuthRefresh(operation.signal, () => this.onAuthError!(operation.signal))
+					: await this.onAuthError();
 				if (newHeaders) {
 					this.config.headers ??= {};
 					Object.assign(this.config.headers, newHeaders);
-					operation.clear();
-					const retryOperation = createMCPTimeout(timeout, this.#operationSignal());
+					if (!this.transportOptions?.beforeSend) operation.clear();
+					const retryOperation = this.transportOptions?.beforeSend
+						? operation
+						: createMCPTimeout(timeout, this.#operationSignal());
 					try {
 						const retry = await this.#fetch(
 							{ method: "POST", body: payload, signal: retryOperation.signal },
@@ -769,7 +999,9 @@ export class HttpTransport implements MCPTransport {
 				}
 			}
 			await resp.body?.cancel();
-		} catch {
+		} catch (error) {
+			if (this.transportOptions?.beforeSend)
+				throw operation.signal?.aborted || isMCPAdmissionError(error) ? error : this.#safeError(error);
 			// Best-effort response delivery — server may have disconnected
 		} finally {
 			operation.clear();
@@ -817,7 +1049,7 @@ export class HttpTransport implements MCPTransport {
 				generated,
 			);
 			stage = "receive";
-			traceId = mcpTraceIdFromHeaders(response.headers);
+			traceId = this.transportOptions?.beforeSend ? undefined : mcpTraceIdFromHeaders(response.headers);
 
 			// 202 Accepted is success for notifications
 			if (!response.ok && response.status !== 202) {
@@ -826,7 +1058,9 @@ export class HttpTransport implements MCPTransport {
 					transport: "http",
 					stage,
 					failure: "http_status",
-					message: `HTTP ${response.status}: ${text}`,
+					message: this.transportOptions?.beforeSend
+						? `HTTP ${response.status}: MCP request failed`
+						: `HTTP ${response.status}: ${text}`,
 					retryable: response.status === 404 || response.status === 502 || response.status === 503,
 					code: response.status,
 					traceId,
@@ -842,12 +1076,16 @@ export class HttpTransport implements MCPTransport {
 				// deadline; keep draining until its connection or the transport closes.
 				const signal = this.#sseConnection
 					? this.#operationSignal(this.#sseConnection.signal)
-					: this.#lifecycleController.signal;
+					: this.transportOptions?.beforeSend
+						? this.#operationSignal()
+						: this.#lifecycleController.signal;
 				this.#trackBackgroundDrain(this.#readSSEStream(response.body, signal));
 			} else {
 				await response.body?.cancel();
 			}
 		} catch (error) {
+			if (isMCPAdmissionError(error)) throw error;
+			if (operation.signal?.aborted && !operation.timedOut()) throw error;
 			if (operation.isTimeoutAbort(error) || operation.timedOut()) {
 				throw new MCPTransportError({
 					transport: "http",
@@ -856,11 +1094,11 @@ export class HttpTransport implements MCPTransport {
 					message: `Notify timeout after ${timeout}ms`,
 					retryable: false,
 					traceId,
-					cause: error,
+					cause: this.transportOptions?.beforeSend ? undefined : error,
 				});
 			}
 			if (error instanceof Error && error.name === "AbortError") throw error;
-			throw normalizeMCPTransportError(error, { transport: "http", stage, traceId });
+			throw this.#normalizeError(error, stage, traceId);
 		} finally {
 			operation.clear();
 		}
@@ -894,21 +1132,40 @@ export class HttpTransport implements MCPTransport {
 			await Promise.allSettled([...this.#activeFetches, ...this.#activeRequests, ...this.#backgroundDrains]);
 		}
 
+		if (this.#pendingAdmissions > 0)
+			logger.debug("MCP HTTP local cleanup complete; callback drain unconfirmed; remote work not confirmed stopped");
+		let terminationError: Error | undefined;
 		if (this.#sessionId) {
 			const timeout = resolveMCPTimeoutMs(this.config.timeout);
-			const operation = createMCPTimeout(timeout);
+			const guarded = !!this.transportOptions?.beforeSend;
+			// Termination has its own cleanup lifetime, but never borrows revoked owner permission.
+			const cleanup = guarded ? new AbortController() : undefined;
+			const cleanupSignal =
+				cleanup && this.transportOptions?.signal
+					? AbortSignal.any([cleanup.signal, this.transportOptions.signal])
+					: cleanup?.signal;
+			const operation = createMCPTimeout(timeout, cleanupSignal);
 			try {
-				const response = await this.#fetch(
+				const attempt = this.#fetch(
 					{ method: "DELETE", signal: operation.signal },
 					{ "Mcp-Session-Id": this.#sessionId },
 				);
+				// Disabled deadlines cannot make close depend on arbitrary callback settlement.
+				// Invalidate this cleanup attempt rather than inventing a timeout.
+				if (guarded && !isMCPTimeoutEnabled(timeout)) cleanup!.abort(closeReason);
+				const response = await attempt;
 				await response.body?.cancel();
-			} catch {
-				// Session termination is best-effort.
+				if (guarded && !response.ok)
+					terminationError = new Error("MCP remote termination unconfirmed; callback drain unconfirmed");
+			} catch (error) {
+				if (guarded)
+					terminationError = isMCPAdmissionError(error)
+						? error
+						: new Error("MCP remote termination unconfirmed; callback drain unconfirmed");
 			} finally {
 				operation.clear();
+				this.#sessionId = null;
 			}
-			this.#sessionId = null;
 		}
 
 		const onClose = this.onClose;
@@ -917,9 +1174,13 @@ export class HttpTransport implements MCPTransport {
 			onClose?.();
 		} catch (error) {
 			logger.debug("MCP HTTP onClose callback failed during transport teardown", {
-				url: this.config.url,
-				error: error instanceof Error ? error.message : String(error),
+				url: this.transportOptions?.beforeSend ? undefined : this.config.url,
+				error: this.#safeError(error).message,
 			});
+		}
+		if (terminationError) {
+			logger.debug("MCP remote termination unconfirmed; callback drain unconfirmed");
+			throw terminationError;
 		}
 	}
 }
@@ -927,8 +1188,19 @@ export class HttpTransport implements MCPTransport {
 /**
  * Create and connect an HTTP transport.
  */
-export async function createHttpTransport(config: MCPHttpServerConfig | MCPSseServerConfig): Promise<HttpTransport> {
-	const transport = new HttpTransport(config);
-	await transport.connect();
-	return transport;
+export async function createHttpTransport(
+	config: MCPHttpServerConfig | MCPSseServerConfig,
+	transportOptions?: MCPTransportOptions,
+	connectSignal?: AbortSignal,
+): Promise<HttpTransport> {
+	const transport = new HttpTransport(config, transportOptions, connectSignal);
+	try {
+		await transport.connect();
+		connectSignal?.throwIfAborted();
+		transportOptions?.signal?.throwIfAborted();
+		return transport;
+	} catch (error) {
+		await transport.close().catch(() => {});
+		throw error;
+	}
 }

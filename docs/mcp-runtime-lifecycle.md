@@ -106,6 +106,16 @@ For each discovered server in `connectServers()`:
 - records the server's negotiated protocol revision; Streamable HTTP carries it on subsequent requests in `MCP-Protocol-Version`,
 - closes transport on init failure.
 
+### Optional trusted-runtime admission
+
+Programmatic callers can pass an `MCPManagerAdmission` factory as the optional fifth `MCPManager` constructor argument, after the existing remote-retry policy. Each server receives one source-bound `MCPServerAdmission`: an owner `signal`, a `beforeAuth` callback, and runtime `transportOptions`. These are trusted in-process inputs, not MCP JSON configuration or user approval decisions. Existing callers without admission retain the ordinary lifecycle.
+
+The manager runs source preflight before initial credential/command resolution, reconnect preparation, auth refresh, and guarded public `prepareConfig`. Guarded transport auth hooks accept the current operation signal and carry it through both initial and reconnect refresh closures; a timed-out preflight cannot later initiate credential preparation or replay. A guarded `prepareConfig` must identify the existing server binding and original unresolved config; it cannot create a new binding or use a prepared credential-bearing config as source authority. After preflight, the same transport options reach initial and replacement connections, and prepared remote headers stay origin-locked.
+
+Owner cancellation, source/config drift, or a native `MCPAdmissionError` retires the binding. Cached and deferred tools cannot revive it; auth/reconnect ladders and lost-server rescheduling stop rather than treating denial as a transient transport failure. A server's JSON error text/code cannot create this native error identity. A fresh authorized source lifecycle is separate from automatic recovery.
+
+Admission is not discovery-source selection, a read-only tool classifier, a credential importer, or human once approval. The embedding runtime still owns those policies and must choose its permitted config sources before connecting. See [transport admission](./mcp-protocol-transports.md#optional-runtime-effect-admission) for exact physical-effect and cancellation boundaries.
+
 ### Fast startup gate + deferred fallback
 
 `connectServers()` waits on a race between:

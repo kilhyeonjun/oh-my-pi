@@ -295,6 +295,50 @@ export interface MCPRequestOptions {
 	signal?: AbortSignal;
 }
 
+/** Exact immutable wire effect, internal to the trusted owning runtime. */
+export interface MCPBeforeSendEvent {
+	readonly transport: "http" | "sse" | "stdio";
+	readonly url?: string;
+	readonly method?: string;
+	/** Already serialized HTTP body or newline-delimited stdio frame. */
+	readonly body?: string;
+	readonly signal: AbortSignal;
+}
+
+/** Final native child invocation; never include these values in diagnostics. */
+export interface MCPBeforeSpawnEvent {
+	readonly argv: readonly string[];
+	readonly cwd: string;
+	readonly env: Readonly<Record<string, string | undefined>>;
+	readonly signal: AbortSignal;
+}
+
+/** Runtime-only hooks; never accepted from MCP JSON configuration. */
+export interface MCPTransportOptions {
+	/** Owning source/session/generation lifetime, separate from handshake timeout. */
+	readonly signal?: AbortSignal;
+	/** Return undefined to admit, or throw to deny. This is not human consent. */
+	readonly beforeSend?: (event: MCPBeforeSendEvent) => void | Promise<void>;
+	readonly beforeSpawn?: (event: MCPBeforeSpawnEvent) => void | Promise<void>;
+	/** Exact final child environment, replacing ambient/config merging. */
+	readonly stdioEnv?: Readonly<Record<string, string | undefined>>;
+}
+
+export interface MCPBeforeAuthEvent {
+	readonly phase: "initial" | "reconnect" | "auth-refresh" | "prepare";
+	readonly signal: AbortSignal;
+}
+
+/** One immutable owning binding, retained across refresh and reconnect. */
+export interface MCPServerAdmission {
+	readonly signal: AbortSignal;
+	readonly transportOptions: MCPTransportOptions;
+	readonly beforeAuth: (event: MCPBeforeAuthEvent) => void | Promise<void>;
+}
+
+/** Resolve a trusted source binding before native auth; names alone confer no authority. */
+export type MCPManagerAdmission = (serverName: string, config: Readonly<MCPServerConfig>) => MCPServerAdmission;
+
 /** Transport interface - abstracts stdio/http */
 export interface MCPTransport {
 	/** Send a request and wait for response */

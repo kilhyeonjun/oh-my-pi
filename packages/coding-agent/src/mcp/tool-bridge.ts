@@ -22,7 +22,7 @@ import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
-import { formatMCPToolFailure, MCPTransportError } from "./errors";
+import { formatMCPToolFailure, isMCPAdmissionError, MCPTransportError } from "./errors";
 import { describeMCPCall, describeMCPResult, renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
 import type {
 	MCPAuthChallenge,
@@ -53,6 +53,7 @@ const RETRIABLE_PATTERNS = [
 	"network error",
 ];
 export function isRetriableConnectionError(error: unknown): boolean {
+	if (isMCPAdmissionError(error)) return false;
 	if (!(error instanceof Error)) return false;
 	if (error instanceof MCPTransportError) {
 		if (
@@ -368,8 +369,9 @@ async function callToolWithAuthRetry(
 	}
 }
 
-/** Re-throw abort-related errors so they bypass error-result handling. */
+/** Re-throw terminal denials and aborts before any error-result or reconnect handling. */
 function rethrowIfAborted(error: unknown, signal?: AbortSignal): void {
+	if (isMCPAdmissionError(error)) throw error;
 	if (error instanceof ToolAbortError) throw error;
 	if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
 	if (signal?.aborted) throw new ToolAbortError();
