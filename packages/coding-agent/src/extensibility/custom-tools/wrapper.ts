@@ -4,6 +4,7 @@
 import type { AgentTool, AgentToolUpdateCallback, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { linkMCPToolWrapper } from "../../mcp/invocation";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { applyToolProxy } from "../tool-proxy";
 import type { CustomTool, CustomToolContext } from "./types";
@@ -25,6 +26,7 @@ export class CustomToolAdapter<
 		private getContext: () => CustomToolContext,
 	) {
 		applyToolProxy(tool, this);
+		linkMCPToolWrapper(this, tool);
 		this.strict = tool.strict;
 		this.loadMode = defaultLoadModeForToolName(tool.name, tool.loadMode);
 	}

@@ -18,6 +18,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
+import type { MCPManager } from "../mcp/manager";
+import type { NativeMCPLifecycle } from "../mcp/session-binding";
+import { getMCPToolOrigin, reserveMCPToolDispatch, cancelMCPToolDispatch } from "../mcp/invocation";
+import type { ToolCallEventResult } from "../extensibility/shared-events";
 
 import {
 	type AfterToolCallContext,
@@ -1074,6 +1078,8 @@ export class AgentSession implements SettingsScope {
 	#sideStreamFn: StreamFn;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
+	readonly #mcpManager: MCPManager | undefined;
+	#nativeMCPLifecycle: NativeMCPLifecycle | undefined;
 
 	readonly #ttsr: TtsrCoordinator;
 	readonly #stats: SessionStatsTracker;
@@ -2188,6 +2194,8 @@ export class AgentSession implements SettingsScope {
 			skillsReloadable: config.skillsReloadable,
 		});
 		this.#disconnectOwnedMcpManager = config.disconnectOwnedMcpManager;
+		this.#mcpManager = config.mcpManager;
+		this.#nativeMCPLifecycle = config.nativeMCPLifecycle;
 		const ttsrHost: TtsrCoordinatorHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -5104,53 +5112,64 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		const runner = this.#extensionRunner;
-		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
-		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
-		if (ttsrResult) {
-			runner?.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
-			return ttsrResult;
-		}
-		if (!runner?.hasHandlers("tool_call")) return undefined;
-		const metadata = ctx.toolCall.providerMetadata;
-		const computer = metadata?.type === "computer" ? metadata : undefined;
-		// Parity with the wrapper's pre-emit short-circuit: an already-denied
-		// call never reaches extensions. Deny is mode-independent (tool decision
-		// or user policy), so resolving under the most permissive mode is exact;
-		// the wrapper still enforces the mode-accurate gate before execution.
-		const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.settings);
-		const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
-		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
-			return undefined;
-		}
-		const eventArgs = computer
-			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
-			: ctx.args;
-		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
-		let callResult: Awaited<ReturnType<ExtensionRunner["emitToolCall"]>>;
+		const mcpOrigin = getMCPToolOrigin(ctx.tool);
+		if (mcpOrigin) reserveMCPToolDispatch(ctx.tool, ctx.toolCall.id, signal);
 		try {
-			callResult = await runner.emitToolCall(
-				{
-					type: "tool_call",
-					toolName: ctx.tool.name,
-					toolCallId: ctx.toolCall.id,
-					input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
-				},
-				signal,
-			);
+			runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+			const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
+			if (ttsrResult) {
+				if (mcpOrigin) cancelMCPToolDispatch(ctx.tool, ctx.toolCall.id);
+				runner?.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+				return ttsrResult;
+			}
+			if (!runner?.hasHandlers("tool_call")) return undefined;
+			const metadata = ctx.toolCall.providerMetadata;
+			const computer = metadata?.type === "computer" ? metadata : undefined;
+			// Parity with the wrapper's pre-emit short-circuit: an already-denied
+			// call never reaches extensions. Deny is mode-independent (tool decision
+			// or user policy), so resolving under the most permissive mode is exact;
+			// the wrapper still enforces the mode-accurate gate before execution.
+			const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.settings);
+			const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
+			if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
+				return undefined;
+			}
+			const eventArgs = computer
+				? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
+				: ctx.args;
+			runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
+			let callResult: ToolCallEventResult | undefined;
+			try {
+				callResult = await runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: ctx.tool.name,
+						toolCallId: ctx.toolCall.id,
+						...(mcpOrigin ? { mcpOrigin } : {}),
+						input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
+					},
+					signal,
+				);
+			} catch (error) {
+				runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+				throw error;
+			}
+			if (callResult?.block) {
+				if (mcpOrigin) cancelMCPToolDispatch(ctx.tool, ctx.toolCall.id);
+				runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+				return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
+			}
+			// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
+			// view, not the execution params — a revision cannot map back onto them.
+			const args = callResult?.input !== undefined && !computer ? callResult.input : undefined;
+			const additionalContext = callResult?.additionalContext;
+			if (args === undefined && additionalContext === undefined) return undefined;
+			return { args, additionalContext };
 		} catch (error) {
-			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+			if (mcpOrigin) cancelMCPToolDispatch(ctx.tool, ctx.toolCall.id);
+			runner?.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 			throw error;
 		}
-		if (callResult?.block) {
-			runner.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
-			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
-		}
-		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
-		// view, not the execution params — a revision cannot map back onto them.
-		const args = callResult?.input !== undefined && !computer ? callResult.input : undefined;
-		const additionalContext = callResult?.additionalContext;
-		if (args === undefined && additionalContext === undefined) return undefined;
-		return { args, additionalContext };
 	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
@@ -5645,6 +5664,15 @@ export class AgentSession implements SettingsScope {
 		this.#movedFromEmptySessionFile = path.resolve(sessionFile);
 	}
 
+	getNativeMCPManager(): MCPManager | undefined {
+		// A guarded lifecycle remains authoritative even while its manager is unavailable.
+		return this.#nativeMCPLifecycle ? this.#nativeMCPLifecycle.manager : this.#mcpManager;
+	}
+
+	async refreshNativeMCP(): Promise<void> {
+		await using _generation = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
+	}
+
 	/**
 	 * Synchronously mark the session as disposing so new work is rejected
 	 * immediately: eval starts throw, queued asides are dropped, the aside
@@ -5657,6 +5685,7 @@ export class AgentSession implements SettingsScope {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		void this.#nativeMCPLifecycle?.revoke().catch(() => {});
 		this.#isDisposed = true;
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
@@ -5978,6 +6007,8 @@ export class AgentSession implements SettingsScope {
 				this.#accountPoolScope?.release();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
+		// Guarded cleanup is not best-effort: timed-out or failed drain stays observable.
+		await this.#nativeMCPLifecycle?.revoke();
 	}
 
 	/** Drop the in-memory conversation state after the terminal dispose flush. */
@@ -6055,6 +6086,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async resetSessionContext(): Promise<ResetSessionContextResult | undefined> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		// Refuse while a response streams OR a foreground user bash/python
 		// execution is in flight: those complete via recordBashResult()/
 		// recordPythonResult(), which append directly to agent.state when not
@@ -10038,6 +10070,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 
@@ -10191,6 +10224,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const requireIdleFor = entryId !== undefined || options?.requireIdle ? "fork the session" : undefined;
 		if (entryId !== undefined) {
@@ -11662,6 +11696,7 @@ export class AgentSession implements SettingsScope {
 			throw new Error(`No API key for ${explicitModel.provider}/${explicitModel.id}`);
 		}
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -12081,6 +12116,7 @@ export class AgentSession implements SettingsScope {
 		cancelled: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
 		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
@@ -12218,6 +12254,7 @@ export class AgentSession implements SettingsScope {
 		sessionId: string,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		const previousSessionFile = this.sessionFile;
 		if (!this.sessionManager.getSessionFile()) {
 			throw new Error("Cannot branch /btw: session is not persisted");
@@ -12394,6 +12431,7 @@ export class AgentSession implements SettingsScope {
 		askReanswerCommitted?: boolean;
 	}> {
 		using _transition = this.#beginSessionTransition();
+		await using _mcpGeneration = await this.#nativeMCPLifecycle?.rotate(() => !this.#isDisposed);
 		await this.#bash.flushPending();
 		const oldLeafId = this.sessionManager.getLeafId();
 

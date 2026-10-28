@@ -65,8 +65,14 @@ describe("/tan prompt-cache tool presentation", () => {
 							description: tool.description,
 							parameters: tool.parameters,
 						}));
+					expect(parent.getToolByName(mcpTool.name)).toBeDefined();
+					expect(child.getToolByName(mcpTool.name)).toBeDefined();
 					if (xdev) expect(parent.getMountedXdevToolNames()).toContain(mcpTool.name);
-					else expect(parent.getMountedXdevToolNames()).toEqual([]);
+					else {
+						expect(parent.getMountedXdevToolNames()).toEqual([]);
+						expect(parent.getActiveToolNames()).toContain(mcpTool.name);
+						expect(child.getActiveToolNames()).toContain(mcpTool.name);
+					}
 					expect(parent.getActiveToolNames()).toContain("ask");
 					expect(child.getMountedXdevToolNames()).toEqual(parent.getMountedXdevToolNames());
 					expect(child.systemPrompt).toEqual(parent.systemPrompt);

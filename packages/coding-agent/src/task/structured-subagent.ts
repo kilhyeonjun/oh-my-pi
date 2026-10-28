@@ -22,6 +22,7 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
+import { getMCPManagerBinding } from "../mcp/session-binding";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
@@ -586,7 +587,7 @@ function buildExecutorOptions(
 	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
 	const localProtocolOptions = sessionLocalProtocolOptions(session);
 	const restrictToolNames = preparedSession !== undefined || policy.planMode || session.restrictToolNames === true;
-	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
+	const enableMCP = !restrictToolNames && !getMCPManagerBinding(session.mcpManager) && (session.enableMCP ?? true);
 	return {
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,

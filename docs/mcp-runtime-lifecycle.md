@@ -2,6 +2,8 @@
 
 This document describes how MCP servers are discovered, connected, exposed as tools, refreshed, and torn down in the coding-agent runtime.
 
+The default startup, discovery and teardown paths below apply without a selected session bootstrap. [Trusted session bootstrap](#optional-trusted-session-bootstrap) replaces those paths with pre-discovery installation and revocable native generations; it does not reuse the outgoing manager or restore its authority on rollback.
+
 ## Lifecycle at a glance
 
 1. **SDK startup** kicks off MCP discovery (unless MCP is disabled or tool names are restricted): headless/SDK sessions await `discoverAndLoadMCPTools()`; interactive sessions (`hasUI: true`) create the manager up front and defer `discoverAndConnect()` until the session is live.
@@ -115,6 +117,22 @@ The manager runs source preflight before initial credential/command resolution, 
 Owner cancellation, source/config drift, or a native `MCPAdmissionError` retires the binding. Cached and deferred tools cannot revive it; auth/reconnect ladders and lost-server rescheduling stop rather than treating denial as a transient transport failure. A server's JSON error text/code cannot create this native error identity. A fresh authorized source lifecycle is separate from automatic recovery.
 
 Admission is not discovery-source selection, a read-only tool classifier, a credential importer, or human once approval. The embedding runtime still owns those policies and must choose its permitted config sources before connecting. See [transport admission](./mcp-protocol-transports.md#optional-runtime-effect-admission) for exact physical-effect and cancellation boundaries.
+
+### Optional trusted session bootstrap
+
+A trusted extension can register `registerMCPSessionBootstrap` while its factory is being bound. The native embedding host selects its actual file-backed extension source; the normal CLI uses the existing admitted trusted-extension lane. A complete bootstrap supplies the native manager's config loader, admission factory and disposal callback before guarded manager construction or any discovery, credential resolution, cached-tool publication or inherited proxy use. Registration is not discovery or user consent. Explicit MCP disable and restricted sessions remain authoritative.
+
+The native `MCPSessionBinding` owns one immutable session/source generation. Duplicate, late, failed or conflicting selected registrations refuse rather than fall back to ambient discovery. Guarded managers do not receive model/global auth storage or become a process-global manager. The fixed-HTTP mode can return one host-sealed HTTP config through the injected loader without reading user/global/provider config; unsupported auth and dynamic expansion refuse before resolution. General exact-file source loading is a separate optional concern.
+
+New/switch/reload, plain and entry-based fork, branch, BTW promotion and disposal revoke outgoing ownership before asynchronous transition effects. MCP dispatch stays unavailable through drain and rebootstrap. Commit adopts a fresh binding; cancellation or rollback never restores revoked inventory or approval. Cleanup/rebootstrap failure remains a visible unavailable generation, not a successful drain. Guarded child/task/vibe and unsupported direct routes cannot inherit a singleton to escape that boundary. With no bootstrap selection/registration, ordinary manager/config/auth behavior remains unchanged.
+
+### Native invocation association
+
+In a bootstrap-bound session, the tool inventory exposes native original-server/tool identity instead of requiring an embedding host to reverse a minted name. Native one-use execution ownership associates the actual registered tool, call, config and generation with each prepared request. Public metadata, copied handles, guessed IDs and raw direct execution cannot manufacture that ownership. Concurrent identical calls remain distinct, and catalog/source/context changes retire old authority.
+
+Physical send admission sees this association together with the already serialized native-prepared body and the current wire ID. A host can disclose the exact prepared effect and obtain once consent before the first sink, then recheck every permitted attempt without copying argument preparation. Startup/catalog/maintenance/server-response/cleanup have separate native control custody; an invocation's permission is not a grant for arbitrary protocol traffic. Association is runtime-only and is not sent in JSON, headers or fetch options, or published into model schemas/history.
+
+The SDK supplies custody, not policy or human consent. A host requiring approval for send/reaction/edit/delete must request a fresh genuine human once for each invocation even when native permission bypass is enabled. An uncertain mutation must not be automatically retransmitted under a previous approval; preserve its uncertain/error result and require a new invocation and fresh approval. Native retry machinery and old unguarded callers keep their existing behavior; a host may refuse retry scope rather than claim exactly-once execution. Gateway/backend hidden retries require their own explicit contract.
 
 ### Fast startup gate + deferred fallback
 

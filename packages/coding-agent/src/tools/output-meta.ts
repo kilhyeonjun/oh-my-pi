@@ -23,7 +23,8 @@ import {
 	truncateTail,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { formatOutputNotice, type OutputMeta, type TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { renderError } from "./tool-errors";
+import { isMCPAdmissionError } from "../mcp/errors";
+import { ToolAbortError, renderError } from "./tool-errors";
 import {
 	cfgToolsArtifactHeadBytes,
 	cfgToolsArtifactMaxBytes,
@@ -758,6 +759,8 @@ async function wrappedExecute(
 		}
 		return result;
 	} catch (e) {
+		if (isMCPAdmissionError(e) || e instanceof ToolAbortError || (e instanceof Error && e.name === "AbortError"))
+			throw e;
 		// Re-throw with formatted message so agent-loop sets isError flag
 		throw new Error(renderError(e));
 	}

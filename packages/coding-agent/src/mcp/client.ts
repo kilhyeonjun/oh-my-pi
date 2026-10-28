@@ -162,6 +162,8 @@ export async function connectToServer(
 	options?: {
 		signal?: AbortSignal;
 		transportOptions?: MCPTransportOptions;
+		/** Native owner accounting, including failed handshakes and late factory settlement. */
+		onOwnedCleanup?: (pending: Promise<void>) => void;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
@@ -185,7 +187,8 @@ export async function connectToServer(
 	const closeOwned = transportOptions
 		? () => {
 				if (!transport) return undefined;
-				closing ??= transport.close().catch(() => {
+				if (closing) return closing;
+				closing = transport.close().catch(() => {
 					try {
 						transport?.onError?.(new Error("MCP connection cleanup is unconfirmed"));
 					} catch {
@@ -193,6 +196,7 @@ export async function connectToServer(
 					}
 					throw new Error("MCP connection cleanup is unconfirmed");
 				});
+				options?.onOwnedCleanup?.(closing);
 				return closing;
 			}
 		: undefined;
@@ -240,13 +244,21 @@ export async function connectToServer(
 		}
 	};
 
+	const connecting = connect();
+	if (transportOptions && options?.onOwnedCleanup)
+		options.onOwnedCleanup(
+			connecting.then(
+				() => {},
+				() => {},
+			),
+		);
 	try {
 		// Race the whole handshake against the signal: the steps after `initialize` (the
 		// initialized notification, the SSE listener) do not observe it themselves.
 		if (!isMCPTimeoutEnabled(timeoutMs)) {
-			return await untilAborted(signal, connect());
+			return await untilAborted(signal, connecting);
 		}
-		return await withTimeout(connect(), timeoutMs, timeoutError, signal);
+		return await withTimeout(connecting, timeoutMs, timeoutError, signal);
 	} catch (error) {
 		// Factories retain late instances; revocation prevents a late spawn/send.
 		abandoned?.abort(error);

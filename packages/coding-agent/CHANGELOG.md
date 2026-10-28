@@ -4,6 +4,7 @@
 
 ### Added
 
+- Trusted extensions can install a session-owned HTTP MCP loader and admission before discovery, inspect native original-tool/invocation custody, and resolve host auth headers only at physical sends with final policy revalidation; stale, forged and cross-session execution refuses without changing ordinary callers.
 - Added optional trusted-runtime MCP admission for source-bound auth preparation, physical HTTP/SSE sends and stdio spawn/frames, with exact child-environment replacement, terminal denial, and abortable asynchronous gates. Existing callers are unchanged; this does not supply config-source policy or human approval. See [runtime lifecycle](../../docs/mcp-runtime-lifecycle.md#optional-trusted-runtime-admission) and [transport admission](../../docs/mcp-protocol-transports.md#optional-runtime-effect-admission).
 
 ## [18.11.3] - 2026-10-16

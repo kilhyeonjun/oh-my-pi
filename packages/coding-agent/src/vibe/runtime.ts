@@ -31,6 +31,7 @@ import { resolveAgentModelSelection } from "../config/model-resolver";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
+import { getMCPManagerBinding } from "../mcp/session-binding";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -1310,7 +1311,10 @@ export class VibeSessionRegistry {
 			settings: session.settings,
 			asyncJobManager: session.asyncJobManager,
 			inheritedSessionAgents: session.getSessionAgents?.(),
-			mcpManager: session.mcpManager ?? MCPManager.instance(),
+			enableMCP: !getMCPManagerBinding(session.mcpManager) && (session.enableMCP ?? true),
+			mcpManager: getMCPManagerBinding(session.mcpManager)
+				? undefined
+				: (session.mcpManager ?? MCPManager.instance()),
 			contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
 			skills: [...(session.skills ?? [])],
 			workspaceTree: session.workspaceTree,

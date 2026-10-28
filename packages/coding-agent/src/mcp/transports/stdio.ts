@@ -585,6 +585,7 @@ export class StdioTransport implements MCPTransport {
 		private readonly transportOptions?: MCPTransportOptions,
 		private readonly connectSignal?: AbortSignal,
 	) {
+		if (transportOptions?.resolveAuthHeaders) throw new MCPAdmissionError();
 		if (transportOptions) {
 			this.transportOptions = Object.freeze({ ...transportOptions });
 		}

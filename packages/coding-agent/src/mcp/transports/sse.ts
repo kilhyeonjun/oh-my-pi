@@ -67,6 +67,7 @@ export class LegacySseTransport implements MCPTransport {
 		config: MCPSseServerConfig,
 		private readonly transportOptions?: MCPTransportOptions,
 	) {
+		if (transportOptions?.resolveAuthHeaders) throw new MCPAdmissionError();
 		if (transportOptions?.beforeSend && config.headerPolicy !== "origin-locked") throw new MCPAdmissionError();
 		this.#config = config;
 		if (transportOptions?.beforeSend) {

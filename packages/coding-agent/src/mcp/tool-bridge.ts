@@ -22,10 +22,12 @@ import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { callTool } from "./client";
+import { beginMCPInvocation, createMCPInvocationOptions, finishMCPInvocation } from "./invocation";
 import { formatMCPToolFailure, isMCPAdmissionError, MCPTransportError } from "./errors";
 import { describeMCPCall, describeMCPResult, renderMCPCall, renderMCPResult } from "@oh-my-pi/pi-tui/tools/mcp";
 import type {
 	MCPAuthChallenge,
+	MCPRequestOptions,
 	MCPServerConnection,
 	MCPToolCallParams,
 	MCPToolCallResult,
@@ -344,8 +346,9 @@ async function callToolWithAuthRetry(
 	args: MCPToolArgs,
 	reconnect: MCPReconnect | undefined,
 	signal?: AbortSignal,
+	options?: MCPRequestOptions,
 ): Promise<MCPToolCallAttempt> {
-	const result = await callTool(connection, toolName, args, { signal });
+	const result = await callTool(connection, toolName, args, options ?? { signal });
 	const authChallenge = getMcpAuthChallenge(result);
 	if (!authChallenge || !reconnect) return { connection, result };
 
@@ -361,7 +364,7 @@ async function callToolWithAuthRetry(
 	try {
 		return {
 			connection: newConnection,
-			result: await callTool(newConnection, toolName, args, { signal }),
+			result: await callTool(newConnection, toolName, args, options ?? { signal }),
 		};
 	} catch (error) {
 		rethrowIfAborted(error, signal);
@@ -709,12 +712,34 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		return describeMCPResult(result, options, normalizeToolArgs(args));
 	}
 
-	async execute(
-		_toolCallId: string,
+	execute(
+		toolCallId: string,
+		params: unknown,
+		onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
+		ctx: CustomToolContext,
+		signal?: AbortSignal,
+	): Promise<CustomToolResult<MCPToolDetails>> {
+		try {
+			const invocation = beginMCPInvocation(this, toolCallId, ctx, signal, this.connection.transport);
+			if (!invocation) return this.#executeInvocation(params, onUpdate, ctx, signal);
+			return this.#executeInvocation(
+				params,
+				onUpdate,
+				ctx,
+				invocation.signal,
+				createMCPInvocationOptions(invocation),
+			).finally(() => finishMCPInvocation(invocation));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	async #executeInvocation(
 		params: unknown,
 		_onUpdate: AgentToolUpdateCallback<MCPToolDetails> | undefined,
 		_ctx: CustomToolContext,
 		signal?: AbortSignal,
+		options?: MCPRequestOptions,
 	): Promise<CustomToolResult<MCPToolDetails>> {
 		throwIfAborted(signal);
 		const args = await prepareOutboundArgs(params, this.tool.inputSchema, _ctx);
@@ -722,7 +747,14 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.connection._source?.providerName;
 
 		try {
-			const attempt = await callToolWithAuthRetry(this.connection, this.tool.name, args, this.reconnect, signal);
+			const attempt = await callToolWithAuthRetry(
+				this.connection,
+				this.tool.name,
+				args,
+				this.reconnect,
+				signal,
+				options,
+			);
 			if (attempt.error !== undefined) {
 				return buildErrorResult(attempt.error, this.connection.name, this.tool.name, provider, providerName);
 			}
@@ -753,7 +785,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 					const retryProvider = newConn._source?.provider ?? provider;
 					const retryProviderName = newConn._source?.providerName ?? providerName;
 					try {
-						const result = await callTool(newConn, this.tool.name, args, { signal });
+						const result = await callTool(newConn, this.tool.name, args, options ?? { signal });
 						return buildResult(result, newConn.name, this.tool.name, retryProvider, retryProviderName);
 					} catch (retryError) {
 						rethrowIfAborted(retryError, signal);

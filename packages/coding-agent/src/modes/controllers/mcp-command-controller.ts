@@ -19,6 +19,8 @@ import {
 	MCPManager,
 	type OAuthEndpoints,
 } from "../../mcp";
+import { MCPBootstrapError } from "../../mcp/bootstrap";
+import { getMCPManagerBinding } from "../../mcp/session-binding";
 import { connectToServer, disconnectServer, listTools } from "../../mcp/client";
 import {
 	addMCPServer,
@@ -369,7 +371,7 @@ type MCPSearchParsed = {
 /**
  * Collect the de-duplicated union of every MCP server name we know about:
  * user config, project config, and any runtime-discovered servers not
- * already present in either config (`ctx.mcpManager.getAllServerNames()`
+ * already present in either config (the live session manager's `getAllServerNames()`
  * covers connections, pending connections, and discovered-but-not-yet-
  * connected sources).
  *
@@ -393,6 +395,12 @@ export async function collectMcpServerNames(
 	includeDisabledOnly = true,
 	includeDisabledConfigured = true,
 ): Promise<string[]> {
+	const manager = ctx.session.getNativeMCPManager();
+	if (getMCPManagerBinding(manager)) {
+		return (manager?.getAllServerNames() ?? []).sort((a, b) =>
+			a.localeCompare(b, undefined, { sensitivity: "base" }),
+		);
+	}
 	let userConfig: MCPConfigFile;
 	let projectConfig: MCPConfigFile;
 	if (preloaded) {
@@ -416,8 +424,8 @@ export async function collectMcpServerNames(
 	};
 	addConfiguredNames(userConfig);
 	addConfiguredNames(projectConfig);
-	if (ctx.mcpManager) {
-		for (const name of ctx.mcpManager.getAllServerNames()) {
+	if (manager) {
+		for (const name of manager.getAllServerNames()) {
 			names.add(name);
 		}
 	}
@@ -427,6 +435,10 @@ export async function collectMcpServerNames(
 export class MCPCommandController {
 	constructor(private ctx: InteractiveModeContext) {}
 
+	get #manager(): MCPManager | undefined {
+		return this.ctx.session.getNativeMCPManager();
+	}
+
 	/**
 	 * Handle /mcp command and route to subcommands
 	 */
@@ -434,6 +446,17 @@ export class MCPCommandController {
 		const parts = parseCommandArgs(text.trim());
 		const subcommand = parts[1]?.toLowerCase();
 		const serverName = parts.slice(2).join(" ") || undefined;
+		const guarded = getMCPManagerBinding(this.#manager);
+		if (guarded) {
+			guarded.signal.throwIfAborted();
+			if (subcommand === "list") {
+				this.#showMessage((this.#manager?.getAllServerNames() ?? []).join("\n"));
+				return;
+			}
+			if (subcommand && !["help", "reload", "reconnect"].includes(subcommand)) {
+				throw new MCPBootstrapError("conflict", "This MCP session has a sealed native source selection");
+			}
+		}
 
 		if (!subcommand || subcommand === "help") {
 			this.#showHelp();
@@ -1142,8 +1165,8 @@ export class MCPCommandController {
 		// Create temporary connection using a test name
 		const testName = `test_${Date.now()}`;
 		let resolvedConfig: MCPServerConfig;
-		if (this.ctx.mcpManager) {
-			resolvedConfig = await this.ctx.mcpManager.prepareConfig(config, options);
+		if (this.#manager) {
+			resolvedConfig = await this.#manager.prepareConfig(config, options);
 		} else {
 			const tempManager = new MCPManager(getProjectDir());
 			tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
@@ -1222,8 +1245,8 @@ export class MCPCommandController {
 		const found = await this.#findConfiguredServer(name);
 		if (found) return { ...found, discovered: false };
 
-		const config = this.ctx.mcpManager?.getServerConfig(name);
-		const source = this.ctx.mcpManager?.getSource(name);
+		const config = this.#manager?.getServerConfig(name);
+		const source = this.#manager?.getSource(name);
 		if (!config || !source) return null;
 
 		return {
@@ -1317,21 +1340,21 @@ export class MCPCommandController {
 		name: string,
 		options?: { suppressDisconnectedWarning?: boolean },
 	): Promise<"connected" | "connecting" | "disconnected"> {
-		if (!this.ctx.mcpManager) return "disconnected";
+		if (!this.#manager) return "disconnected";
 
 		const block = new McpConnectingBlock(name);
 		this.ctx.present(block);
 
 		try {
 			try {
-				await withTimeout(this.ctx.mcpManager.waitForConnection(name), 10_000, "Connection still pending");
+				await withTimeout(this.#manager.waitForConnection(name), 10_000, "Connection still pending");
 			} catch {
 				// Ignore timeout/errors here and use status check below.
 			}
-			const state = this.ctx.mcpManager.getConnectionStatus(name);
+			const state = this.#manager.getConnectionStatus(name);
 			if (state === "connected") {
 				// Connection may complete after initial reload; rebind runtime MCP tools now.
-				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+				await this.ctx.session.refreshMCPTools(this.#manager.getTools());
 			}
 			if (state === "connected") {
 				block.setStatus(theme.fg("success", `${theme.status.enabled} Connected to "${name}"`));
@@ -1351,11 +1374,11 @@ export class MCPCommandController {
 	}
 
 	async #syncManagerConnection(name: string, config: MCPServerConfig): Promise<void> {
-		if (!this.ctx.mcpManager) return;
-		if (this.ctx.mcpManager.getConnectionStatus(name) !== "disconnected") return;
-		await this.ctx.mcpManager.connectServers({ [name]: config }, {});
-		if (this.ctx.mcpManager.getConnectionStatus(name) === "connected") {
-			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+		if (!this.#manager) return;
+		if (this.#manager.getConnectionStatus(name) !== "disconnected") return;
+		await this.#manager.connectServers({ [name]: config }, {});
+		if (this.#manager.getConnectionStatus(name) === "connected") {
+			await this.ctx.session.refreshMCPTools(this.#manager.getTools());
 		}
 	}
 
@@ -1392,8 +1415,8 @@ export class MCPCommandController {
 			// refreshMCPTools preserves the prior MCP tool selection, so tools from
 			// brand-new servers are registered in the registry but never activated.
 			// Explicitly activate the newly added server's tools now.
-			if (isConnected && this.ctx.mcpManager) {
-				const serverTools = this.ctx.mcpManager.getTools().filter(t => t.mcpServerName === name);
+			if (isConnected && this.#manager) {
+				const serverTools = this.#manager.getTools().filter(t => t.mcpServerName === name);
 				if (serverTools.length > 0) {
 					const currentActive = this.ctx.session.getEnabledToolNames();
 					const toActivate = serverTools.map(t => t.name).filter(n => this.ctx.session.getToolByName(n));
@@ -1481,12 +1504,12 @@ export class MCPCommandController {
 			const configServerNames = new Set([...userServers, ...projectServers]);
 			const disabledServerNames = new Set(userConfig.disabledServers ?? []);
 			const discoveredServers: { name: string; source: SourceMeta }[] = [];
-			if (this.ctx.mcpManager) {
+			if (this.#manager) {
 				const allServerNames = await collectMcpServerNames(this.ctx, { userConfig, projectConfig });
 				for (const name of allServerNames) {
 					if (configServerNames.has(name)) continue;
 					if (disabledServerNames.has(name)) continue;
-					const source = this.ctx.mcpManager.getSource(name);
+					const source = this.#manager.getSource(name);
 					if (source) {
 						discoveredServers.push({ name, source });
 					}
@@ -1519,9 +1542,7 @@ export class MCPCommandController {
 					const config = userConfig.mcpServers![name];
 					const type = config.type ?? "stdio";
 					const state =
-						config.enabled === false
-							? "inactive"
-							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
+						config.enabled === false ? "inactive" : (this.#manager?.getConnectionStatus(name) ?? "disconnected");
 					const status =
 						state === "inactive"
 							? theme.fg("warning", " ◌ inactive")
@@ -1542,9 +1563,7 @@ export class MCPCommandController {
 					const config = projectConfig.mcpServers![name];
 					const type = config.type ?? "stdio";
 					const state =
-						config.enabled === false
-							? "inactive"
-							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
+						config.enabled === false ? "inactive" : (this.#manager?.getConnectionStatus(name) ?? "disconnected");
 					const status =
 						state === "inactive"
 							? theme.fg("warning", " ◌ inactive")
@@ -1563,7 +1582,7 @@ export class MCPCommandController {
 				for (const { providerName, shortPath, items: entries } of groupBySource(discoveredServers, e => e.source)) {
 					lines.push(theme.fg("accent", providerName) + theme.fg("muted", ` (${shortPath}):`));
 					for (const { name } of entries) {
-						const state = this.ctx.mcpManager!.getConnectionStatus(name);
+						const state = this.#manager!.getConnectionStatus(name);
 						const status =
 							state === "connected"
 								? theme.fg("success", " ● connected")
@@ -1621,8 +1640,8 @@ export class MCPCommandController {
 			}
 
 			// Disconnect if connected
-			if (this.ctx.mcpManager?.getConnection(name)) {
-				await this.ctx.mcpManager.disconnectServer(name);
+			if (this.#manager?.getConnection(name)) {
+				await this.#manager.disconnectServer(name);
 			}
 
 			// Remove from config
@@ -1734,8 +1753,8 @@ export class MCPCommandController {
 
 			// Resolve auth config if needed
 			let resolvedConfig: MCPServerConfig;
-			if (this.ctx.mcpManager) {
-				resolvedConfig = await this.ctx.mcpManager.prepareConfig(config);
+			if (this.#manager) {
+				resolvedConfig = await this.#manager.prepareConfig(config);
 			} else {
 				const tempManager = new MCPManager(getProjectDir());
 				tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
@@ -1834,7 +1853,7 @@ export class MCPCommandController {
 				// Check if this is a discovered server from a third-party config
 				const userConfigPath = getMCPConfigPath("user", getProjectDir());
 				const disabledServers = new Set(await readDisabledServers(userConfigPath));
-				const isDiscovered = this.ctx.mcpManager?.getSource(name);
+				const isDiscovered = this.#manager?.getSource(name);
 				const isCurrentlyDisabled = disabledServers.has(name);
 				if (!isDiscovered && !isCurrentlyDisabled) {
 					this.ctx.showError(`Server "${name}" not found.`);
@@ -1868,8 +1887,8 @@ export class MCPCommandController {
 						].join("\n"),
 					);
 				} else {
-					await this.ctx.mcpManager?.disconnectServer(name);
-					await this.ctx.session.refreshMCPTools(this.ctx.mcpManager?.getTools() ?? []);
+					await this.#manager?.disconnectServer(name);
+					await this.ctx.session.refreshMCPTools(this.#manager?.getTools() ?? []);
 					this.#showMessage(["", theme.fg("muted", `${theme.status.disabled} Disabled "${name}"`), ""].join("\n"));
 				}
 				return;
@@ -1889,8 +1908,8 @@ export class MCPCommandController {
 			if (enabled) {
 				await this.#connectEnabledMCPServer(name);
 			} else {
-				await this.ctx.mcpManager?.disconnectServer(name);
-				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager?.getTools() ?? []);
+				await this.#manager?.disconnectServer(name);
+				await this.ctx.session.refreshMCPTools(this.#manager?.getTools() ?? []);
 			}
 
 			let status = "";
@@ -1981,6 +2000,8 @@ export class MCPCommandController {
 
 	/** Reauthorize a server after a tool-level OAuth challenge. */
 	async handleMCPAuthChallenge(name: string, challenge: MCPAuthChallenge): Promise<MCPServerConfig | undefined> {
+		if (getMCPManagerBinding(this.#manager))
+			throw new MCPBootstrapError("conflict", "Guarded MCP does not support managed authentication");
 		return this.#handleReauth(name, { silent: true, reload: false, authChallenge: challenge });
 	}
 
@@ -2143,7 +2164,7 @@ export class MCPCommandController {
 		try {
 			this.#showMessage(["", theme.fg("muted", "Reloading MCP servers and runtime tools..."), ""].join("\n"));
 			await this.reloadServers();
-			const manager = this.ctx.mcpManager;
+			const manager = this.#manager;
 			const connectedCount = manager?.getConnectedServers().length ?? 0;
 			const connectingCount =
 				manager?.getAllServerNames().filter(name => manager.getConnectionStatus(name) === "connecting").length ?? 0;
@@ -2169,7 +2190,7 @@ export class MCPCommandController {
 			this.ctx.showError("Server name required. Usage: /mcp reconnect <name>");
 			return;
 		}
-		if (!this.ctx.mcpManager) {
+		if (!this.#manager) {
 			this.ctx.showError("MCP manager not available.");
 			return;
 		}
@@ -2177,13 +2198,13 @@ export class MCPCommandController {
 		this.#showMessage(["", theme.fg("muted", `Reconnecting to "${name}"...`), ""].join("\n"));
 
 		try {
-			const connection = await this.ctx.mcpManager.reconnectServer(name, { manual: true });
+			const connection = await this.#manager.reconnectServer(name, { manual: true });
 			if (connection) {
 				// refreshMCPTools re-registers tools and preserves the user's prior
 				// MCP tool selection. No need to call activateDiscoveredMCPTools —
 				// that would broaden the selection to all server tools.
-				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
-				const serverTools = this.ctx.mcpManager.getTools().filter(t => t.mcpServerName === name);
+				await this.ctx.session.refreshMCPTools(this.#manager.getTools());
+				const serverTools = this.#manager.getTools().filter(t => t.mcpServerName === name);
 				this.#showMessage(
 					[
 						"\n",
@@ -2203,7 +2224,7 @@ export class MCPCommandController {
 	}
 
 	async #connectEnabledMCPServer(name: string): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		if (!this.#manager) {
 			return;
 		}
 
@@ -2212,13 +2233,13 @@ export class MCPCommandController {
 		});
 		const config = configs[name];
 		if (!config) {
-			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+			await this.ctx.session.refreshMCPTools(this.#manager.getTools());
 			return;
 		}
 
 		const source = sources[name];
-		const result = await this.ctx.mcpManager.connectServers({ [name]: config }, source ? { [name]: source } : {});
-		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+		const result = await this.#manager.connectServers({ [name]: config }, source ? { [name]: source } : {});
+		await this.ctx.session.refreshMCPTools(this.#manager.getTools());
 		this.#showMCPConnectionErrors(result.errors);
 	}
 
@@ -2248,12 +2269,16 @@ export class MCPCommandController {
 	 * keep project `.mcp.json` servers from being started on reload.
 	 */
 	async reloadServers(): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		if (getMCPManagerBinding(this.#manager)) {
+			await this.ctx.session.refreshNativeMCP();
+			return;
+		}
+		if (!this.#manager) {
 			return;
 		}
 
 		// Disconnect all existing servers
-		await this.ctx.mcpManager.disconnectAll();
+		await this.#manager.disconnectAll();
 		// Prompt enrichment is asynchronous. Clear commands before rediscovery so
 		// removed/disabled servers cannot leave stale `/server:prompt` entries;
 		// newly loaded prompts repopulate them through the manager callback.
@@ -2263,13 +2288,13 @@ export class MCPCommandController {
 		clearFsCache();
 
 		// Rediscover and connect, mirroring startup's discovery filters.
-		const result = await this.ctx.mcpManager.discoverAndConnect({
+		const result = await this.#manager.discoverAndConnect({
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(this.ctx.settings),
 			filterExa: true,
 			filterBrowser: this.ctx.session.getEvalPreludes().some(definition => definition.name === "browser"),
 			extensionRoots: this.ctx.session.effectiveExtensionRoots,
 		});
-		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+		await this.ctx.session.refreshMCPTools(this.#manager.getTools());
 
 		this.#showMCPConnectionErrors(result.errors);
 	}
@@ -2278,17 +2303,17 @@ export class MCPCommandController {
 	 * Handle /mcp resources - Show available resources from connected servers
 	 */
 	async #handleResources(): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		if (!this.#manager) {
 			this.ctx.showError("No MCP manager available.");
 			return;
 		}
 
-		const servers = this.ctx.mcpManager.getConnectedServers();
+		const servers = this.#manager.getConnectedServers();
 		const lines: string[] = [];
 		let hasAny = false;
 
 		for (const name of servers) {
-			const data = this.ctx.mcpManager.getServerResources(name);
+			const data = this.#manager.getServerResources(name);
 			if (!data) continue;
 			const { resources, templates } = data;
 			if (resources.length === 0 && templates.length === 0) continue;
@@ -2320,17 +2345,17 @@ export class MCPCommandController {
 	 * Handle /mcp prompts - Show available prompts from connected servers
 	 */
 	async #handlePrompts(): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		if (!this.#manager) {
 			this.ctx.showError("No MCP manager available.");
 			return;
 		}
 
-		const servers = this.ctx.mcpManager.getConnectedServers();
+		const servers = this.#manager.getConnectedServers();
 		const lines: string[] = [];
 		let hasAny = false;
 
 		for (const name of servers) {
-			const prompts = this.ctx.mcpManager.getServerPrompts(name);
+			const prompts = this.#manager.getServerPrompts(name);
 			if (!prompts?.length) continue;
 			hasAny = true;
 
@@ -2360,13 +2385,13 @@ export class MCPCommandController {
 	 * Handle /mcp notifications - Show notification and subscription state
 	 */
 	async #handleNotifications(): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		if (!this.#manager) {
 			this.ctx.showError("No MCP manager available.");
 			return;
 		}
 
-		const { enabled, subscriptions } = this.ctx.mcpManager.getNotificationState();
-		const servers = this.ctx.mcpManager.getConnectedServers();
+		const { enabled, subscriptions } = this.#manager.getNotificationState();
+		const servers = this.#manager.getConnectedServers();
 		const statusIcon = enabled ? theme.fg("success", "enabled") : theme.fg("warning", "disabled");
 		const lines: string[] = [];
 		lines.push(`  Status: ${statusIcon}  ${theme.fg("dim", "(mcp.notifications setting)")}`);
@@ -2374,7 +2399,7 @@ export class MCPCommandController {
 
 		let hasAny = false;
 		for (const name of servers) {
-			const connection = this.ctx.mcpManager.getConnection(name);
+			const connection = this.#manager.getConnection(name);
 			if (!connection) continue;
 			const caps = connection.capabilities;
 			const supportsResources = caps.resources !== undefined;

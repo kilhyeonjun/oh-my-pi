@@ -43,10 +43,18 @@ import type { MCPStoredOAuthCredential } from "./oauth-flow";
 import type { McpConnectionStatusEvent } from "./startup-events";
 import { resolveMCPStartupTimeoutMs } from "./timeout";
 import { runMCPAdmission } from "./admission";
+import {
+	assertMCPFixedHTTPConfig,
+	continueMCPToolInvocation,
+	registerMCPConfig,
+	registerMCPTool,
+	retireMCPTool,
+} from "./invocation";
+import { getMCPManagerBinding } from "./session-binding";
 import { MCPAdmissionError, isMCPAdmissionError } from "./errors";
 
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
-import { DeferredMCPTool, MCPTool } from "./tool-bridge";
+import { DeferredMCPTool, MCPTool, type MCPReconnect } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import { setGeneratedHeader } from "./transports/header-policy";
 import type {
@@ -364,6 +372,26 @@ export class MCPManager {
 	#lostRemoteServers = new Map<string, { timer: NodeJS.Timeout | undefined; delayMs: number }>();
 
 	#admissions?: Map<string, OwnedAdmission>;
+	#ownedDrains?: Set<Promise<void>>;
+	#ownedDrainFailure?: unknown;
+	#ownedAdmissionCallbacks?: Set<Promise<void>>;
+
+	#runOwnedAdmission(signal: AbortSignal, callback: () => void | Promise<void>): Promise<void> {
+		if (!getMCPManagerBinding(this)) return runMCPAdmission(signal, callback);
+		return runMCPAdmission(signal, () => {
+			const pending = Promise.resolve().then(() => {
+				signal.throwIfAborted();
+				return callback();
+			});
+			this.#ownedAdmissionCallbacks ??= new Set();
+			this.#ownedAdmissionCallbacks.add(pending);
+			void pending.then(
+				() => this.#ownedAdmissionCallbacks?.delete(pending),
+				() => this.#ownedAdmissionCallbacks?.delete(pending),
+			);
+			return pending;
+		});
+	}
 
 	constructor(
 		private cwd: string,
@@ -376,6 +404,8 @@ export class MCPManager {
 	}
 
 	#stopAdmission(name: string, discard = true): MCPAdmissionError {
+		if (getMCPManagerBinding(this))
+			for (const tool of this.#tools) if (tool.mcpServerName === name) retireMCPTool(tool);
 		const owned = this.#admissions?.get(name);
 		if (owned?.terminal) return owned.terminal;
 		const error = new MCPAdmissionError();
@@ -388,7 +418,7 @@ export class MCPManager {
 		if (connection && discard) {
 			if (isAuthRefreshableMCPTransport(connection.transport)) connection.transport.onAuthError = undefined;
 			this.#detachConnection(name, connection);
-			void disconnectServer(connection).catch(() => {});
+			void this.#discardConnection(name, connection).catch(() => {});
 		}
 		return error;
 	}
@@ -402,12 +432,21 @@ export class MCPManager {
 	}
 
 	#captureAdmission(name: string, config: MCPServerConfig): OwnedAdmission | undefined {
-		if (!this.admission) return undefined;
+		if (!this.admission) {
+			if (getMCPManagerBinding(this)) throw new MCPAdmissionError();
+			return undefined;
+		}
 		const existing = this.#admissions?.get(name);
 		if (existing) {
 			this.#checkAdmission(name, existing);
 			if (existing.config !== config) throw this.#stopAdmission(name);
 			return existing;
+		}
+		const nativeOwner = getMCPManagerBinding(this);
+		if (nativeOwner) {
+			nativeOwner.signal.throwIfAborted();
+			assertMCPFixedHTTPConfig(config);
+			if (this.#admissions!.size !== 0) throw new MCPAdmissionError();
 		}
 		const abort = new AbortController();
 		// Snapshot trusted runtime hooks once; never reacquire a revoked source binding.
@@ -430,11 +469,15 @@ export class MCPManager {
 			this.#admissions!.set(name, owned);
 			throw this.#stopAdmission(name);
 		}
-		const signal = AbortSignal.any([
+		if (nativeOwner && !supplied.transportOptions.beforeSend) throw new MCPAdmissionError();
+		if (supplied.transportOptions.resolveAuthHeaders) assertMCPFixedHTTPConfig(config);
+		const signals = [
 			supplied.signal,
 			...(supplied.transportOptions.signal ? [supplied.transportOptions.signal] : []),
 			abort.signal,
-		]);
+		];
+		if (nativeOwner) signals.push(nativeOwner.signal);
+		const signal = AbortSignal.any(signals);
 		const beforeSend = supplied.transportOptions.beforeSend;
 		const beforeSpawn = supplied.transportOptions.beforeSpawn;
 		const binding: MCPServerAdmission = Object.freeze({
@@ -447,7 +490,7 @@ export class MCPManager {
 					? {
 							beforeSend: async (event: Parameters<typeof beforeSend>[0]) => {
 								try {
-									await runMCPAdmission(event.signal, () => beforeSend(event));
+									await this.#runOwnedAdmission(event.signal, () => beforeSend(event));
 								} catch (error) {
 									if (isMCPAdmissionError(error)) throw this.#stopAdmission(name);
 									throw error;
@@ -469,6 +512,7 @@ export class MCPManager {
 					: {}),
 			}),
 		});
+		registerMCPConfig(this, binding.transportOptions, name, config);
 		const owned: OwnedAdmission = { config, binding, abort };
 		this.#admissions!.set(name, owned);
 		signal.addEventListener(
@@ -502,8 +546,12 @@ export class MCPManager {
 		this.#checkAdmission(name, owned);
 		const signal = AbortSignal.any([owned!.binding.signal, opts?.signal ?? this.#connectAbort.signal]);
 		try {
-			await runMCPAdmission(signal, () => owned!.binding.beforeAuth({ phase, signal }));
+			await this.#runOwnedAdmission(signal, () => owned!.binding.beforeAuth({ phase, signal }));
 			this.#checkAdmission(name, owned, signal);
+			if (getMCPManagerBinding(this) || owned!.binding.transportOptions.resolveAuthHeaders) {
+				if (phase === "auth-refresh" || opts?.forceRefresh || opts?.oauth) throw new MCPAdmissionError();
+				return config;
+			}
 			const resolved = await this.#resolveAuthConfig(config, { ...opts, signal });
 			this.#checkAdmission(name, owned, signal);
 			return resolved.type === "http" || resolved.type === "sse"
@@ -960,6 +1008,20 @@ export class MCPManager {
 		const connectionTasks: ConnectionTask[] = [];
 
 		for (const [name, config] of Object.entries(configs)) {
+			const admitted = this.#admissions?.get(name);
+			if (admitted && (admitted.config !== config || admitted.terminal || admitted.binding.signal.aborted)) {
+				const error = this.#stopAdmission(name);
+				const hadTools = this.#tools.some(tool => tool.mcpServerName === name);
+				this.#tools = this.#tools.filter(tool => tool.mcpServerName !== name);
+				if (hadTools) {
+					this.#emitToolsChanged();
+					this.#notifyOwnerToolsChanged().catch(() => {});
+				}
+				errors.set(name, error.message);
+				validationFailures.push({ name, message: error.message });
+				reportedErrors.add(name);
+				continue;
+			}
 			this.#startupServers.add(name);
 			if (sources[name]) {
 				this.#sources.set(name, sources[name]);
@@ -1014,6 +1076,9 @@ export class MCPManager {
 					throw this.#stopAdmission(name);
 				return connectToServer(name, resolvedConfig, {
 					signal: owned ? AbortSignal.any([connectSignal, owned.binding.signal]) : connectSignal,
+					...(getMCPManagerBinding(this)
+						? { onOwnedCleanup: (pending: Promise<void>) => this.#trackOwnedDrain(pending) }
+						: undefined),
 					...(owned ? { transportOptions: owned.binding.transportOptions } : undefined),
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
@@ -1037,7 +1102,7 @@ export class MCPManager {
 						this.#pendingConnections.get(name) !== connectionPromise
 					) {
 						this.#detachConnection(name, connection);
-						void disconnectServer(connection).catch(() => {});
+						void this.#discardConnection(name, connection).catch(() => {});
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
 					}
 
@@ -1050,6 +1115,8 @@ export class MCPManager {
 					// definition-only configs (url-keyed fallback) get Bearer injection
 					// too and need the same mid-session refresh hook.
 					if (
+						!getMCPManagerBinding(this) &&
+						!owned?.binding.transportOptions.resolveAuthHeaders &&
 						isAuthRefreshableMCPTransport(connection.transport) &&
 						lookupMcpOAuthCredential(this.#authStorage, config)
 					) {
@@ -1098,7 +1165,7 @@ export class MCPManager {
 					// would return with no error while #pendingToolLoads stayed set
 					// and future connects for this server were skipped.
 					this.#detachConnection(name, connection);
-					void disconnectServer(connection).catch(() => {});
+					void this.#discardConnection(name, connection).catch(() => {});
 					throw error;
 				}
 			});
@@ -1113,7 +1180,7 @@ export class MCPManager {
 					this.#pendingToolLoads.delete(name);
 					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
 						this.reconnectServer(name, options);
-					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+					const customTools = this.#createNativeTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					await this.#notifyOwnerToolsChanged();
 					void this.toolCache?.set(name, config, serverTools);
@@ -1196,7 +1263,7 @@ export class MCPManager {
 					const { connection, serverTools } = value;
 					connectedServers.add(name);
 					const reconnect = () => this.reconnectServer(name);
-					this.#replaceServerTools(name, MCPTool.fromTools(connection, serverTools, reconnect));
+					this.#replaceServerTools(name, this.#createNativeTools(connection, serverTools, reconnect));
 				} else if (task.tracked.status === "rejected") {
 					// disconnectAll aborted this handshake inside the startup window: torn down, not failed.
 					if (isAbortedHandshake(task.connectSignal, task.tracked.reason)) continue;
@@ -1206,7 +1273,7 @@ export class MCPManager {
 					reportedErrors.add(name);
 				} else {
 					const cached = cachedTools.get(name);
-					if (cached) {
+					if (cached && !getMCPManagerBinding(this)) {
 						const source = this.#sources.get(name);
 						const reconnect = () => this.reconnectServer(name);
 						this.#replaceServerTools(
@@ -1234,7 +1301,34 @@ export class MCPManager {
 	 * can prefix another's (`atlassian` vs `atlassian:atlassian`) and a name
 	 * with sanitized characters never prefix-matches its own tools at all.
 	 */
-	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+	#createNativeTools(
+		connection: MCPServerConnection,
+		definitions: MCPToolDefinition[],
+		reconnect?: MCPReconnect,
+	): MCPTool[] {
+		const nativeTools = MCPTool.fromTools(connection, definitions, reconnect);
+		if (getMCPManagerBinding(this))
+			for (let index = 0; index < nativeTools.length; index++)
+				registerMCPTool(nativeTools[index], connection.transport, definitions[index]);
+		return nativeTools;
+	}
+
+	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[], reconnect = false): void {
+		if (getMCPManagerBinding(this)) {
+			const names = new Set(this.#tools.filter(tool => tool.mcpServerName !== name).map(tool => tool.name));
+			for (const tool of tools) {
+				if (names.has(tool.name)) throw this.#stopAdmission(name);
+				names.add(tool.name);
+			}
+			for (const tool of this.#tools) {
+				if (tool.mcpServerName !== name) continue;
+				if (reconnect) {
+					const replacement = tools.find(candidate => candidate.mcpToolName === tool.mcpToolName);
+					if (replacement) continueMCPToolInvocation(tool, replacement);
+				}
+				retireMCPTool(tool);
+			}
+		}
 		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
@@ -1536,13 +1630,29 @@ export class MCPManager {
 	 */
 	async #discardConnection(name: string, connection: MCPServerConnection): Promise<void> {
 		this.#detachConnection(name, connection);
-		await disconnectServer(connection);
+		const drain = disconnectServer(connection);
+		if (getMCPManagerBinding(this)) this.#trackOwnedDrain(drain);
+		await drain;
+	}
+
+	#trackOwnedDrain(drain: Promise<void>): void {
+		this.#ownedDrains ??= new Set();
+		this.#ownedDrains.add(drain);
+		void drain.then(
+			() => this.#ownedDrains?.delete(drain),
+			error => {
+				this.#ownedDrains?.delete(drain);
+				this.#ownedDrainFailure = error;
+			},
+		);
 	}
 
 	/**
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		if (getMCPManagerBinding(this))
+			for (const tool of this.#tools) if (tool.mcpServerName === name) retireMCPTool(tool);
 		if (this.#admissions?.has(name)) this.#stopAdmission(name, false);
 		this.#startupServers.delete(name);
 		this.#startupFailures.delete(name);
@@ -1580,10 +1690,34 @@ export class MCPManager {
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
 	}
 
+	/** Internal session barrier: cancellation is not successful physical drain. */
+	async drainOwnedSession(): Promise<void> {
+		if (!getMCPManagerBinding(this)) {
+			await this.disconnectAll();
+			return;
+		}
+		const pending = [
+			this.#discoveryInFlight,
+			...this.#pendingConnections.values(),
+			...this.#pendingToolLoads.values(),
+			...this.#pendingReconnections.values(),
+			...this.#startupUpdates.values(),
+			...Array.from(this.#toolRefreshes.values(), refresh => refresh.promise),
+			...Array.from(this.#pendingResourceRefresh.values(), refresh => refresh.promise),
+		];
+		if (this.#ownerToolsRun) pending.push(this.#ownerToolsRun);
+		await this.disconnectAll();
+		await Promise.allSettled(pending);
+		while (this.#ownedDrains?.size) await Promise.allSettled(this.#ownedDrains);
+		while (this.#ownedAdmissionCallbacks?.size) await Promise.allSettled(this.#ownedAdmissionCallbacks);
+		if (this.#ownedDrainFailure !== undefined) throw new Error("MCP native transport drain is unconfirmed");
+	}
+
 	/**
 	 * Disconnect from all servers.
 	 */
 	async disconnectAll(): Promise<void> {
+		if (getMCPManagerBinding(this)) for (const tool of this.#tools) retireMCPTool(tool);
 		// Invalidate any in-flight reconnection attempts that outlive this call.
 		// They captured the old epoch; after increment they'll detect staleness.
 		// A scheduled retry that fired during the teardown below would sample
@@ -1634,6 +1768,7 @@ export class MCPManager {
 		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge },
 	): Promise<MCPServerConnection | null> {
 		this.#checkAdmission(name);
+		if (getMCPManagerBinding(this) && options?.authChallenge) throw this.#stopAdmission(name);
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
 		}
@@ -1764,7 +1899,9 @@ export class MCPManager {
 		if (reconnectOwner && !authChallenge) {
 			const signal = AbortSignal.any([reconnectOwner.binding.signal, this.#connectAbort.signal]);
 			try {
-				await runMCPAdmission(signal, () => reconnectOwner.binding.beforeAuth({ phase: "reconnect", signal }));
+				await this.#runOwnedAdmission(signal, () =>
+					reconnectOwner.binding.beforeAuth({ phase: "reconnect", signal }),
+				);
 				this.#checkAdmission(name, reconnectOwner, signal);
 			} catch (error) {
 				if (isMCPAdmissionError(error) || reconnectOwner.binding.signal.aborted) throw this.#stopAdmission(name);
@@ -1903,6 +2040,9 @@ export class MCPManager {
 			throw new MCPAdmissionError();
 		const connection = await connectToServer(name, resolvedConfig, {
 			signal: connectSignal,
+			...(getMCPManagerBinding(this)
+				? { onOwnedCleanup: (pending: Promise<void>) => this.#trackOwnedDrain(pending) }
+				: undefined),
 			...(owned ? { transportOptions: owned.binding.transportOptions } : undefined),
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
@@ -1919,7 +2059,7 @@ export class MCPManager {
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
 		if (this.#serverConfigs.get(name) !== config || this.#epoch !== reconnectEpoch) {
 			this.#detachConnection(name, connection);
-			void disconnectServer(connection).catch(() => {});
+			void this.#discardConnection(name, connection).catch(() => {});
 			throw new Error(`Server "${name}" was disconnected during reconnection`);
 		}
 
@@ -1927,7 +2067,12 @@ export class MCPManager {
 
 		// Wire auth refresh for HTTP-like transports, and reconnect for any transport.
 		// Same gate as connectServers: any resolvable managed credential.
-		if (isAuthRefreshableMCPTransport(connection.transport) && lookupMcpOAuthCredential(this.#authStorage, config)) {
+		if (
+			!getMCPManagerBinding(this) &&
+			!owned?.binding.transportOptions.resolveAuthHeaders &&
+			isAuthRefreshableMCPTransport(connection.transport) &&
+			lookupMcpOAuthCredential(this.#authStorage, config)
+		) {
 			connection.transport.onAuthError = async signal => {
 				const refreshed = await this.#prepareAdmitted(name, config, "auth-refresh", { forceRefresh: true, signal });
 				if (refreshed.type === "http" || refreshed.type === "sse") {
@@ -1946,9 +2091,9 @@ export class MCPManager {
 			const serverTools = await listTools(connection);
 			this.#checkAdmission(name, owned, connectSignal);
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
-			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+			const customTools = this.#createNativeTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);
-			this.#replaceServerTools(name, customTools);
+			this.#replaceServerTools(name, customTools, true);
 			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
@@ -1956,7 +2101,7 @@ export class MCPManager {
 			// Detach synchronously and close in the background so a slow close
 			// cannot delay the rejection (and the retry backoff that follows).
 			this.#detachConnection(name, connection);
-			void disconnectServer(connection).catch(() => {});
+			void this.#discardConnection(name, connection).catch(() => {});
 			throw error;
 		}
 	}
@@ -2034,7 +2179,7 @@ export class MCPManager {
 		// Reload tools
 		const serverTools = await listTools(connection);
 		const reconnect = () => this.reconnectServer(name);
-		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+		const customTools = this.#createNativeTools(connection, serverTools, reconnect);
 		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server

@@ -72,6 +72,7 @@ import {
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
+import { selectTrustedMCPBootstrap } from "./mcp/session-binding";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
@@ -2354,6 +2355,12 @@ export async function runRootCommand(
 			const extensionsResult = parsedArgs.trustedExtensions?.length
 				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
 				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+			if (parsedArgs.trustedExtensions?.length) {
+				sessionOptions.mcpBootstrap = selectTrustedMCPBootstrap(
+					extensionsResult,
+					sessionOptions.additionalExtensionPaths ?? [],
+				);
+			}
 			const extensionFlagSink: ExtensionFlagSink = {
 				getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 				setFlagValue: (name, value) => {

@@ -19,6 +19,8 @@ import type {
 	SimpleStreamOptions,
 	ToolChoice,
 } from "@oh-my-pi/pi-ai";
+import type { MCPManager } from "../mcp/manager";
+import type { NativeMCPLifecycle } from "../mcp/session-binding";
 import type { postmortem } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
@@ -399,6 +401,10 @@ export interface AgentSessionConfig {
 	advisorConfigWarnings?: string[];
 	/** Disconnect the MCP manager owned by this session during disposal. */
 	disconnectOwnedMcpManager?: () => Promise<void>;
+	/** Ordinary SDK manager, owned or borrowed; ignored when a native lifecycle exists. */
+	mcpManager?: MCPManager;
+	/** Native-only guarded generation lifecycle; not extension supplied. */
+	nativeMCPLifecycle?: NativeMCPLifecycle;
 	/** System prompt used by automatic session-title generation. */
 	titleSystemPrompt?: string;
 	/**

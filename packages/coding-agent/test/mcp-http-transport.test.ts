@@ -215,7 +215,8 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 				return new Response("{not-json", { headers: { "Content-Type": "application/json" } });
 			},
 		});
-		const transport = await connectedTransport();
+		// Decoding diagnostics are independent of the short deadline fixtures.
+		const transport = await connectedTransport(0);
 
 		await expect(transport.request("tools/list")).rejects.toMatchObject({
 			transport: "http",

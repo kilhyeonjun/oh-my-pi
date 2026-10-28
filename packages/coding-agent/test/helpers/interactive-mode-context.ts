@@ -93,6 +93,7 @@ export function createSessionStub(
 	sessionManager: SessionManager,
 	sessionSettings: Settings,
 	overrides?: SessionOverrides,
+	getNativeMCPManager: () => MCPManager | undefined = () => undefined,
 ): AgentSession {
 	if (overrides !== undefined && !isPlainObject(overrides)) return overrides as AgentSession;
 	const stub = {
@@ -126,6 +127,7 @@ export function createSessionStub(
 		getEnabledToolNames: () => [],
 		getContextUsage: () => undefined,
 		getGoalModeState: () => undefined,
+		getNativeMCPManager,
 		refreshMCPTools: vi.fn(async () => {}),
 		setMCPPromptCommands: vi.fn(),
 		setActiveToolsByName: vi.fn(async () => {}),
@@ -199,7 +201,12 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 	// not evaluate and freeze accessor overrides on the remaining keys.
 	const sessionManager = resolveSessionManager(overrides.sessionManager);
 	const contextSettings = resolveSettings(overrides.settings);
-	const session = createSessionStub(sessionManager, contextSettings, overrides.session);
+	const session = createSessionStub(
+		sessionManager,
+		contextSettings,
+		overrides.session,
+		(): MCPManager | undefined => ctx.mcpManager,
+	);
 	const viewSession =
 		overrides.viewSession === undefined
 			? undefined

@@ -29,6 +29,13 @@ import {
 } from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import {
+	bindMCPTransport,
+	createMCPControlCustody,
+	createMCPRequestCustody,
+	isGuardedMCPTransport,
+	type MCPSendCustody,
+} from "../invocation";
+import {
 	createMCPTimeout,
 	getNeverAbortSignal,
 	isMCPTimeoutEnabled,
@@ -110,6 +117,8 @@ export class HttpTransport implements MCPTransport {
 	#closePromise: Promise<void> | null = null;
 	#pendingAdmissions = 0;
 	readonly #observeAdmission?: (pending: boolean) => void;
+	#authResolutions?: Set<Promise<unknown>>;
+	readonly #observeAuthResolution?: (pending: Promise<unknown>) => void;
 	/**
 	 * Protocol version echoed in the `MCP-Protocol-Version` header. `null` until
 	 * the `initialize` response is negotiated (via {@link setProtocolVersion}):
@@ -131,11 +140,34 @@ export class HttpTransport implements MCPTransport {
 		private readonly transportOptions?: MCPTransportOptions,
 		private readonly connectSignal?: AbortSignal,
 	) {
+		if (
+			transportOptions?.resolveAuthHeaders &&
+			(config.type !== "http" ||
+				config.headerPolicy !== "origin-locked" ||
+				config.auth ||
+				config.oauth ||
+				!transportOptions.beforeSend)
+		)
+			throw new MCPAdmissionError();
+		if (transportOptions?.resolveAuthHeaders) {
+			this.#authResolutions = new Set();
+			this.#observeAuthResolution = pending => {
+				this.#authResolutions!.add(pending);
+				void pending.then(
+					() => this.#authResolutions!.delete(pending),
+					() => this.#authResolutions!.delete(pending),
+				);
+			};
+		}
+		bindMCPTransport(this, transportOptions);
 		if (transportOptions?.beforeSend && config.headerPolicy !== "origin-locked") throw new MCPAdmissionError();
 		if (transportOptions?.beforeSend) {
 			this.transportOptions = Object.freeze({
 				beforeSend: transportOptions.beforeSend,
 				signal: transportOptions.signal,
+				...(transportOptions.resolveAuthHeaders
+					? { resolveAuthHeaders: transportOptions.resolveAuthHeaders }
+					: undefined),
 			});
 			this.#observeAdmission = pending => {
 				this.#pendingAdmissions += pending ? 1 : -1;
@@ -185,7 +217,14 @@ export class HttpTransport implements MCPTransport {
 	 * after `initialize`). Before negotiation — the `initialize` request itself —
 	 * no protocol-version header is sent from either source.
 	 */
-	#fetch(init: MCPFetchInit, generated: Record<string, string>): Promise<Response> {
+	#fetch(init: MCPFetchInit, generated: Record<string, string>, custody?: MCPSendCustody): Promise<Response> {
+		if (isGuardedMCPTransport(this) && !custody)
+			custody = createMCPControlCustody(
+				this,
+				init.method === "DELETE" ? "cleanup" : "maintenance",
+				undefined,
+				init.body,
+			);
 		const configured = withoutHeader(this.config.headers, "MCP-Protocol-Version");
 		const withVersion =
 			this.#protocolVersion === null ? generated : { "MCP-Protocol-Version": this.#protocolVersion, ...generated };
@@ -197,6 +236,9 @@ export class HttpTransport implements MCPTransport {
 			this.transportOptions,
 			"http",
 			this.#observeAdmission,
+			undefined,
+			custody,
+			this.#observeAuthResolution,
 		);
 		this.#activeFetches.add(request);
 		void request.then(
@@ -451,7 +493,11 @@ export class HttpTransport implements MCPTransport {
 		if (this.#sessionId) generated["Mcp-Session-Id"] = this.#sessionId;
 		let response = await this.#fetch({ method: "GET", signal }, generated);
 		const refreshAuth = this.onAuthError;
-		if (refreshAuth && (response.status === 401 || response.status === 403)) {
+		if (
+			refreshAuth &&
+			!this.transportOptions?.resolveAuthHeaders &&
+			(response.status === 401 || response.status === 403)
+		) {
 			await response.body?.cancel();
 			const newHeaders = await this.#awaitAuthRefresh(signal, () =>
 				this.transportOptions?.beforeSend ? refreshAuth.call(this, signal) : refreshAuth.call(this),
@@ -579,6 +625,7 @@ export class HttpTransport implements MCPTransport {
 				!isMCPAdmissionError(error) &&
 				!(error instanceof SSEResumeError) &&
 				this.onAuthError &&
+				!this.transportOptions?.resolveAuthHeaders &&
 				(status === 401 || status === 403)
 			) {
 				const refreshSignal = logical?.operation.signal;
@@ -624,6 +671,10 @@ export class HttpTransport implements MCPTransport {
 			method,
 			params: params ?? {},
 		};
+		const serialized = JSON.stringify(body);
+		const custody = isGuardedMCPTransport(this)
+			? createMCPRequestCustody(this, method, options, id, serialized)
+			: undefined;
 
 		const generated: Record<string, string> = {
 			"Content-Type": "application/json",
@@ -656,8 +707,9 @@ export class HttpTransport implements MCPTransport {
 
 		try {
 			const response = await this.#fetch(
-				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
+				{ method: "POST", body: serialized, signal: operation.signal },
 				generated,
+				custody,
 			);
 			stage = "receive";
 			traceId = this.transportOptions?.beforeSend ? undefined : mcpTraceIdFromHeaders(response.headers);
@@ -937,6 +989,10 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	async #handleServerRequest(request: JsonRpcRequest): Promise<void> {
+		if (isGuardedMCPTransport(this)) {
+			await this.#sendServerResponse(request.id, undefined, { code: -32601, message: "Unsupported server request" });
+			return;
+		}
 		if (!this.onRequest) {
 			await this.#sendServerResponse(request.id, undefined, { code: -32601, message: "Method not found" });
 			return;
@@ -972,9 +1028,17 @@ export class HttpTransport implements MCPTransport {
 		const timeout = resolveMCPTimeoutMs(this.config.timeout);
 		const operation = createMCPTimeout(timeout, this.#operationSignal());
 		try {
-			const resp = await this.#fetch({ method: "POST", body: payload, signal: operation.signal }, generated);
+			const resp = await this.#fetch(
+				{ method: "POST", body: payload, signal: operation.signal },
+				generated,
+				isGuardedMCPTransport(this) ? createMCPControlCustody(this, "server-response", id, payload) : undefined,
+			);
 			// Retry once on auth failure if onAuthError is wired
-			if (this.onAuthError && (resp.status === 401 || resp.status === 403)) {
+			if (
+				this.onAuthError &&
+				!this.transportOptions?.resolveAuthHeaders &&
+				(resp.status === 401 || resp.status === 403)
+			) {
 				await resp.body?.cancel();
 				const newHeaders = this.transportOptions?.beforeSend
 					? await this.#awaitAuthRefresh(operation.signal, () => this.onAuthError!(operation.signal))
@@ -1013,6 +1077,7 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	async #sendNotification(method: string, params?: Record<string, unknown>): Promise<void> {
+		if (isGuardedMCPTransport(this) && method !== "notifications/initialized") throw new MCPAdmissionError();
 		if (!this.#connected) {
 			throw new MCPTransportError({
 				transport: "http",
@@ -1038,6 +1103,10 @@ export class HttpTransport implements MCPTransport {
 			generated["Mcp-Session-Id"] = this.#sessionId;
 		}
 
+		const serialized = JSON.stringify(body);
+		const custody = isGuardedMCPTransport(this)
+			? createMCPControlCustody(this, "startup", undefined, serialized)
+			: undefined;
 		const timeout = resolveMCPTimeoutMs(this.config.timeout);
 		const operation = createMCPTimeout(timeout, this.#operationSignal());
 		let stage: MCPFailureStage = "send";
@@ -1045,8 +1114,9 @@ export class HttpTransport implements MCPTransport {
 
 		try {
 			const response = await this.#fetch(
-				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
+				{ method: "POST", body: serialized, signal: operation.signal },
 				generated,
+				custody,
 			);
 			stage = "receive";
 			traceId = this.transportOptions?.beforeSend ? undefined : mcpTraceIdFromHeaders(response.headers);
@@ -1128,13 +1198,26 @@ export class HttpTransport implements MCPTransport {
 		// Aborting is only the cancellation request. Wait until fetches and body
 		// readers have actually observed it before session/process teardown can
 		// close their sockets underneath still-running promise continuations.
-		while (this.#activeFetches.size > 0 || this.#activeRequests.size > 0 || this.#backgroundDrains.size > 0) {
+		while (
+			this.#activeFetches.size > 0 ||
+			this.#activeRequests.size > 0 ||
+			this.#backgroundDrains.size > 0 ||
+			(this.#authResolutions?.size ?? 0) > 0
+		) {
 			await Promise.allSettled([...this.#activeFetches, ...this.#activeRequests, ...this.#backgroundDrains]);
+			if (this.#authResolutions?.size) await Promise.allSettled(this.#authResolutions);
 		}
 
 		if (this.#pendingAdmissions > 0)
 			logger.debug("MCP HTTP local cleanup complete; callback drain unconfirmed; remote work not confirmed stopped");
 		let terminationError: Error | undefined;
+		if (
+			(isGuardedMCPTransport(this) || this.transportOptions?.resolveAuthHeaders) &&
+			this.transportOptions?.signal?.aborted
+		)
+			this.#sessionId = null;
+		if (isGuardedMCPTransport(this) && this.#pendingAdmissions > 0)
+			terminationError = new Error("MCP admission callback drain is unconfirmed");
 		if (this.#sessionId) {
 			const timeout = resolveMCPTimeoutMs(this.config.timeout);
 			const guarded = !!this.transportOptions?.beforeSend;

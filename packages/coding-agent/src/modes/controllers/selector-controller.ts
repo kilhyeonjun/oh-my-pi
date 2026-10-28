@@ -627,7 +627,7 @@ export class SelectorController {
 			runtime: createExtensionDashboardRuntime({
 				cwd: getProjectDir(),
 				settings: this.ctx.settings,
-				mcpManager: this.ctx.mcpManager,
+				getMcpManager: () => this.ctx.session.getNativeMCPManager(),
 				eventBus: this.ctx.eventBus,
 				onMcpToolsChanged: tools => this.ctx.session.refreshMCPTools(tools),
 				browserMcpFilterEnabled: () =>

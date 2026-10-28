@@ -17,7 +17,10 @@ import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
+import { getMCPToolOrigin } from "../mcp/invocation";
+import { MCPAdmissionError } from "../mcp/errors";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -28,6 +31,7 @@ import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md"
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
+import type { Tool } from "../tools";
 import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
@@ -62,6 +66,38 @@ import { cfgDisabledExtensions, cfgSkills, type SkillsSettings } from "../extens
 import { cfgExternalThinking, cfgIncludeModelInPrompt, cfgInlineToolDescriptors, cfgSkillful } from "./settings";
 import { cfgStartupQuiet } from "../modes/settings";
 import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsXdevDocs, cfgToolsXdevInlineDevices } from "../tools/settings";
+
+let pendingMCPTools: WeakSet<AgentTool> | undefined;
+
+/** Construct the native deferred-discovery entry, retaining custody of its final wrapper. */
+export function createPendingMCPTool(name: string, extensionRunner: ExtensionRunner): Tool {
+	const parsed = parseMCPToolName(name);
+	const serverName = parsed?.serverName;
+	const mcpToolName = parsed?.toolName ?? name;
+	const message = serverName
+		? `MCP server "${serverName}" is still connecting; tool "${name}" is not yet available. Retry after the MCP connection completes.`
+		: `MCP discovery is still in progress; tool "${name}" is not yet available. Retry after MCP connection completes.`;
+	const pending: Tool & { mcpServerName?: string; mcpToolName?: string } = {
+		name,
+		label: serverName ? `${serverName}/${mcpToolName}` : name,
+		description: `Pending MCP tool. ${message}`,
+		parameters: { type: "object", properties: {}, additionalProperties: true },
+		approval: "write",
+		intent: "omit",
+		mcpServerName: serverName,
+		mcpToolName,
+		async execute() {
+			return {
+				content: [{ type: "text", text: message }],
+				details: { serverName, mcpToolName, isError: true },
+				isError: true,
+			};
+		},
+	};
+	const tool = new ExtensionToolWrapper(pending, extensionRunner);
+	(pendingMCPTools ??= new WeakSet()).add(tool);
+	return tool;
+}
 
 /** Capabilities borrowed from the owning AgentSession. */
 export interface SessionToolsHost {
@@ -770,7 +806,14 @@ export class SessionTools {
 				scope: "temporary",
 				origin: "top-level",
 			};
-			return { name, description: tool.description, parameters: tool.parameters, sourceInfo };
+			const mcpOrigin = getMCPToolOrigin(tool);
+			return {
+				name,
+				description: tool.description,
+				parameters: tool.parameters,
+				sourceInfo,
+				...(mcpOrigin ? { mcpOrigin } : undefined),
+			};
 		});
 	}
 
@@ -2257,6 +2300,15 @@ export class SessionTools {
 			);
 			return (extensionRunner ? new ExtensionToolWrapper(wrapped, extensionRunner) : wrapped) as AgentTool;
 		});
+		for (const tool of managerTools) {
+			if (!getMCPToolOrigin(tool)) continue;
+			const existing = this.#toolRegistry.get(tool.name);
+			if (
+				this.#extensionMcpTools.has(tool.name) ||
+				(existing && !getMCPToolOrigin(existing) && !pendingMCPTools?.has(existing))
+			)
+				throw new MCPAdmissionError();
+		}
 		const managerToolSet = new Set(managerTools);
 		const reconciledTools = deduplicateMCPToolsByName([...this.#extensionMcpTools.values(), ...managerTools]);
 

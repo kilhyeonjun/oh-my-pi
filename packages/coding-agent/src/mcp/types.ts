@@ -11,6 +11,7 @@ import type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } 
 // =============================================================================
 
 import type { SourceMeta } from "../capability/types";
+import type { MCPSessionBinding } from "./session-binding";
 
 export interface JsonRpcRequest {
 	jsonrpc: "2.0";
@@ -290,13 +291,51 @@ export interface MCPToolCallResult {
 // Transport Types
 // =============================================================================
 
+declare const configIdentityBrand: unique symbol;
+declare const toolOriginBrand: unique symbol;
+declare const invocationIdentityBrand: unique symbol;
+declare const controlIdentityBrand: unique symbol;
+
+export interface MCPConfigIdentity {
+	readonly [configIdentityBrand]: true;
+	readonly owner: MCPSessionBinding;
+	readonly serverName: string;
+}
+export interface MCPToolOrigin {
+	readonly [toolOriginBrand]: true;
+	readonly config: MCPConfigIdentity;
+	readonly serverName: string;
+	readonly toolName: string;
+	readonly catalogRevision: number;
+}
+export interface MCPInvocationIdentity {
+	readonly [invocationIdentityBrand]: true;
+	readonly origin: MCPToolOrigin;
+	readonly toolCallId: string;
+	readonly signal: AbortSignal;
+}
+export interface MCPControlIdentity {
+	readonly [controlIdentityBrand]: true;
+	readonly config: MCPConfigIdentity;
+	readonly phase: "startup" | "catalog" | "maintenance" | "server-response" | "cleanup";
+	readonly signal: AbortSignal;
+}
+export type MCPSendAssociation =
+	| { readonly kind: "invocation"; readonly invocation: MCPInvocationIdentity }
+	| { readonly kind: "control"; readonly control: MCPControlIdentity };
+
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
+	readonly invocation?: MCPInvocationIdentity;
 }
 
 /** Exact immutable wire effect, internal to the trusted owning runtime. */
 export interface MCPBeforeSendEvent {
+	/** Present only with late HTTP credential resolution; final is not a retry. */
+	readonly admissionPhase?: "prepare" | "final";
+	readonly association?: MCPSendAssociation;
+	readonly wireId?: string | number;
 	readonly transport: "http" | "sse" | "stdio";
 	readonly url?: string;
 	readonly method?: string;
@@ -313,8 +352,20 @@ export interface MCPBeforeSpawnEvent {
 	readonly signal: AbortSignal;
 }
 
+export interface MCPResolveAuthHeadersEvent {
+	readonly transport: "http";
+	readonly url: string;
+	readonly method: "GET" | "POST" | "DELETE";
+	readonly signal: AbortSignal;
+	readonly association?: MCPSendAssociation;
+}
+
 /** Runtime-only hooks; never accepted from MCP JSON configuration. */
 export interface MCPTransportOptions {
+	/** Host-owned credential references resolve only after prepare admission. */
+	readonly resolveAuthHeaders?: (
+		event: MCPResolveAuthHeadersEvent,
+	) => Readonly<Record<string, string>> | Promise<Readonly<Record<string, string>>>;
 	/** Owning source/session/generation lifetime, separate from handshake timeout. */
 	readonly signal?: AbortSignal;
 	/** Return undefined to admit, or throw to deny. This is not human consent. */

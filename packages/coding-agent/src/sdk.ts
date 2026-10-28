@@ -156,7 +156,7 @@ import {
 	type MCPToolsLoadResult,
 	shouldFilterBrowserMCPForPrelude,
 } from "./mcp";
-import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
+
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
@@ -222,6 +222,7 @@ import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import {
 	collectMountedMCPToolRoutes,
+	createPendingMCPTool,
 	projectMountedMCPXdevGuidance,
 	type SettingsGatedToolDelta,
 } from "./session/session-tools";
@@ -483,38 +484,6 @@ function buildMcpNotificationBatchMessage(entries: McpNotificationEntry[]): Agen
 	};
 }
 
-function createPendingMCPTool(name: string): Tool {
-	const parsed = parseMCPToolName(name);
-	const serverName = parsed?.serverName;
-	const mcpToolName = parsed?.toolName ?? name;
-	const label = serverName ? `${serverName}/${mcpToolName}` : name;
-	const message = serverName
-		? `MCP server "${serverName}" is still connecting; tool "${name}" is not yet available. Retry after the MCP connection completes.`
-		: `MCP discovery is still in progress; tool "${name}" is not yet available. Retry after MCP connection completes.`;
-	const tool: Tool & { mcpServerName?: string; mcpToolName?: string } = {
-		name,
-		label,
-		description: `Pending MCP tool. ${message}`,
-		parameters: {
-			type: "object",
-			properties: {},
-			additionalProperties: true,
-		},
-		approval: "write",
-		intent: "omit",
-		mcpServerName: serverName,
-		mcpToolName,
-		async execute() {
-			return {
-				content: [{ type: "text", text: message }],
-				details: { serverName, mcpToolName, isError: true },
-				isError: true,
-			};
-		},
-	};
-	return tool;
-}
-
 function collectPendingMCPToolNames(explicitToolNames: readonly string[] | undefined): string[] {
 	const names = new Set<string>();
 	for (const name of explicitToolNames ?? []) {
@@ -753,11 +722,13 @@ export interface CreateAgentSessionOptions {
 	slashCommands?: FileSlashCommand[];
 
 	/**
-	 * Enable MCP capabilities. `false` skips MCP discovery and ignores
-	 * `mcpManager`, preventing process-global or inherited MCP access. Default:
+	 * Enable MCP discovery and manager inheritance. `false` skips discovery and
+	 * ignores `mcpManager`; ordinary explicit `mcpTools` remain available. Default:
 	 * true.
 	 */
 	enableMCP?: boolean;
+	/** Native embedding-host selection of one absolute trusted file-backed extension. */
+	mcpBootstrap?: { readonly extensionPath: string };
 	/** Existing MCP manager to reuse when MCP is enabled (skips discovery, propagates to toolSession). */
 	mcpManager?: MCPManager;
 	/**
@@ -766,7 +737,9 @@ export interface CreateAgentSessionOptions {
 	 * wholesale by `refreshMCPTools` — so a parent `/mcp reload` can both add
 	 * and remove them. Passed as `customTools` they would instead be retained as
 	 * extension-owned tools across every refresh. A same-named `customTools`
-	 * entry keeps precedence and drops the proxy. Ignored for restricted sessions.
+	 * entry keeps precedence and drops the proxy. Available even when discovery is
+	 * disabled. Ignored for restricted sessions and native guarded selection or
+	 * manager inheritance.
 	 */
 	mcpTools?: CustomTool[];
 
@@ -973,7 +946,28 @@ export type { CustomTool, CustomToolFactory } from "./extensibility/custom-tools
 export type * from "./extensibility/extensions";
 export type { Skill } from "./extensibility/skills";
 export type { FileSlashCommand } from "./extensibility/slash-commands";
-export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResult } from "./mcp";
+export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResult, MCPConfigLoader } from "./mcp";
+export * from "./mcp/bootstrap";
+export type { LoadMCPConfigsOptions, LoadMCPConfigsResult } from "./mcp/config";
+export type {
+	MCPManagerAdmission,
+	MCPServerAdmission,
+	MCPTransportOptions,
+	MCPRequestOptions,
+	MCPBeforeSendEvent,
+	MCPBeforeSpawnEvent,
+	MCPBeforeAuthEvent,
+	MCPConfigIdentity,
+	MCPToolOrigin,
+	MCPInvocationIdentity,
+	MCPControlIdentity,
+	MCPSendAssociation,
+	MCPResolveAuthHeadersEvent,
+} from "./mcp/types";
+import { MCPBootstrapError } from "./mcp/bootstrap";
+import { claimMCPBootstrap, getMCPManagerBinding, NativeMCPBootstrapLifecycle } from "./mcp/session-binding";
+import { linkMCPToolWrapper, carryMCPExecutionContext } from "./mcp/invocation";
+export { MCPAdmissionError, isMCPAdmissionError } from "./mcp/errors";
 // Agent registry: pass a private instance per `createAgentSession` when
 // embedding several concurrent top-level sessions in one process (the default
 // global registry admits only one "Main" per process generation).
@@ -1422,8 +1416,11 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 		// legacy `deny`/`prompt` policies; RegisteredToolAdapter re-exposes it.
 		legacyName: tool.legacyName,
 		sourcePath,
-		execute: (toolCallId, params, signal, onUpdate, ctx) =>
-			tool.execute(toolCallId, params, onUpdate, createCustomToolContext(ctx), signal),
+		execute: (toolCallId, params, signal, onUpdate, ctx) => {
+			const customContext = createCustomToolContext(ctx);
+			carryMCPExecutionContext(ctx, customContext);
+			return tool.execute(toolCallId, params, onUpdate, customContext, signal);
+		},
 		onSession: tool.onSession ? (event, ctx) => tool.onSession?.(event, createCustomToolContext(ctx)) : undefined,
 		renderCall: tool.renderCall,
 		renderResult: tool.renderResult
@@ -1439,6 +1436,7 @@ export function customToolToDefinition(tool: CustomTool, sourcePath?: string): T
 			: undefined,
 		[TOOL_DEFINITION_MARKER]: true,
 	};
+	linkMCPToolWrapper(definition, tool);
 	return definition;
 }
 
@@ -2230,6 +2228,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId));
 	let session!: AgentSession;
 	let hasSession = false;
+	let nativeMCPLifecycle: NativeMCPBootstrapLifecycle | undefined;
 	let hasRegistered = false;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
@@ -2525,8 +2524,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
-		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
+		if (!restrictToolNames && options.enableMCP !== false && options.mcpBootstrap && options.mcpManager) {
+			throw new MCPBootstrapError("conflict", "Selected native MCP bootstrap cannot reuse an existing manager");
+		}
+		const inheritedGuardedMCP = getMCPManagerBinding(options.mcpManager) !== undefined;
+		const enableMCP = !restrictToolNames && !inheritedGuardedMCP && (options.enableMCP ?? true);
+		const guardedMCP = enableMCP && options.mcpBootstrap !== undefined;
+		if (enableMCP && !guardedMCP && options.preloadedExtensions)
+			claimMCPBootstrap(options.preloadedExtensions, undefined);
+		if (guardedMCP && (options.mcpManager || options.mcpTools?.length)) {
+			throw new MCPBootstrapError(
+				"conflict",
+				"Guarded bootstrap cannot inherit an existing manager or tool proxies",
+			);
+		}
 		let mcpManager: MCPManager | undefined = enableMCP ? options.mcpManager : undefined;
+		let attachMcpNotifications: ((manager: MCPManager | undefined) => void) | undefined;
+		let unsubscribeMcpNotifications: (() => void) | undefined;
+		let unregisterMcpPostmortem: (() => void) | undefined;
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
@@ -2559,7 +2574,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			filterBrowser: initialBrowserPreludeAvailable,
 			extensionRoots: buildSessionExtensionRoots(),
 		};
-		if (enableMCP && !mcpManager) {
+		if (enableMCP && !guardedMCP && !mcpManager) {
 			if (deferMCPDiscoveryForUI) {
 				const cacheStorage = settings.getStorage();
 				mcpManager = new MCPManager(cwd, cacheStorage ? new MCPToolCache(cacheStorage) : null);
@@ -2773,6 +2788,78 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 		toolSession.preparedExtensions = extensionsResult.preparedExtensions;
+
+		if (enableMCP) {
+			const bootstrap = claimMCPBootstrap(extensionsResult, options.mcpBootstrap);
+			if (bootstrap) {
+				nativeMCPLifecycle = new NativeMCPBootstrapLifecycle(
+					bootstrap,
+					() => ({
+						cwd: sessionManager.getCwd(),
+						sessionId: sessionManager.getSessionId(),
+						agentKind: options.parentTaskPrefix ? "subagent" : "main",
+					}),
+					mcpDiscoverOptions,
+					async (manager, result) => {
+						attachMcpNotifications?.(manager);
+						if (manager) {
+							mcpManager = manager;
+							toolSession.mcpManager = manager;
+							manager.setOnToolsChanged(async tools => {
+								if (getMCPManagerBinding(manager)?.signal.aborted || !hasSession || session.isDisposed) return;
+								await session.refreshMCPTools(tools);
+							});
+						}
+						if (hasSession) {
+							await session.refreshMCPTools(result?.tools ?? []);
+						} else if (result) {
+							const names = new Set<string>();
+							for (const tool of result.tools) {
+								if (
+									names.has(tool.name) ||
+									toolRegistry.has(tool.name) ||
+									options.customTools?.some(candidate => candidate.name === tool.name) ||
+									extensionsResult.extensions.some(extension => extension.tools.has(tool.name))
+								) {
+									throw new MCPBootstrapError(
+										"conflict",
+										"Guarded MCP tool registration collides with an existing tool",
+									);
+								}
+								names.add(tool.name);
+							}
+							customTools.push(...result.tools);
+							initialMcpManagerTools.push(...result.tools);
+						}
+					},
+				);
+				mcpManager = await nativeMCPLifecycle.initialize(!deferMCPDiscoveryForUI);
+				// Guarded tools are added only after native factory binding and admitted discovery.
+				if (!deferMCPDiscoveryForUI && initialMcpManagerTools.length) {
+					const extension = await loadExtensionFromFactory(
+						createCustomToolsExtension(initialMcpManagerTools),
+						cwd,
+						eventBus,
+						extensionsResult.runtime,
+						"<native-mcp>",
+					);
+					extensionsResult.extensions.push(extension);
+				}
+				if (deferMCPDiscoveryForUI) {
+					const lifecycle = nativeMCPLifecycle;
+					startDeferredMCPDiscovery = liveSession =>
+						liveSession.setPendingMCPDiscovery(
+							lifecycle.discover().catch(error => {
+								liveSession.emitNotice(
+									"error",
+									"Guarded native MCP discovery failed; this generation is unavailable",
+								);
+								throw error;
+							}),
+						);
+				}
+			}
+		}
 
 		// Process provider registrations queued during extension loading.
 		// This must happen before the runner is created so that models registered by
@@ -3478,9 +3565,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				? []
 				: (options.customTools?.filter(tool => !isLegacyBuiltinToolDefinition(tool)) ?? []);
 		const explicitCustomToolNames = new Set(explicitCustomTools.map(tool => tool.name));
-		const sdkMcpTools = restrictToolNames
-			? []
-			: (options.mcpTools ?? []).filter(tool => !explicitCustomToolNames.has(tool.name));
+		const sdkMcpTools =
+			restrictToolNames || inheritedGuardedMCP || options.mcpBootstrap !== undefined
+				? []
+				: (options.mcpTools ?? []).filter(tool => !explicitCustomToolNames.has(tool.name));
 		initialMcpManagerTools.push(...sdkMcpTools);
 		const sdkCustomTools = [...sdkMcpTools, ...explicitCustomTools];
 		const sdkCustomToolNames = new Set(sdkCustomTools.map(tool => tool.name));
@@ -3537,20 +3625,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const tool = nativeToolsByName.get(name);
 			return tool ? { tool, makeContext: () => toolContextStore.getContext() } : undefined;
 		});
-		if (deferMCPDiscoveryForUI && mcpManager) {
-			for (const name of collectPendingMCPToolNames(options.toolNames)) {
-				if (!toolRegistry.has(name)) {
-					toolRegistry.set(name, createPendingMCPTool(name));
-					initialMcpManagerToolNames.add(name);
-				}
-			}
-		}
 
 		// Wrap every tool with `ExtensionToolWrapper` so the per-tool approval gate runs on every
 		// call site, regardless of whether any user extensions are loaded. See the runner-construction
 		// comment above for the safety invariant this enforces.
 		for (const tool of toolRegistry.values()) {
 			toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
+		}
+		if (deferMCPDiscoveryForUI && mcpManager) {
+			for (const name of collectPendingMCPToolNames(options.toolNames)) {
+				if (!toolRegistry.has(name)) {
+					toolRegistry.set(name, createPendingMCPTool(name, extensionRunner));
+					initialMcpManagerToolNames.add(name);
+				}
+			}
 		}
 		// Image and speech generation are optional custom tools gated by live settings.
 		// They install here, not through the custom-tools extension, so the settings
@@ -3788,16 +3876,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Cursor's resource frames ask what THIS client's servers advertise; only
 		// live connections have any. Built once: the advisor bridges answer from
 		// the same connections the primary does.
+		// Once installed, rotation replaces this live reference without clearing it.
 		const cursorMcpResources: CursorMcpResourceAdapter | undefined = mcpManager && {
-			serverNames: () => mcpManager.getConnectedServers(),
+			serverNames: () => mcpManager!.getConnectedServers(),
 			getServerResources: async name => {
 				// The manager registers a server's tools before its background
 				// resource load finishes, so a frame arriving in that window
 				// would read an empty cache and report "advertises nothing".
-				await mcpManager.ensureServerResources(name);
-				return mcpManager.getServerResources(name);
+				await mcpManager!.ensureServerResources(name);
+				return mcpManager!.getServerResources(name);
 			},
-			readServerResource: (name, uri) => mcpManager.readServerResource(name, uri),
+			readServerResource: (name, uri) => mcpManager!.readServerResource(name, uri),
 		};
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
@@ -4724,8 +4813,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry,
 			reconcileBrowserMcpFilter: mcpManager
 				? async enabled => {
-						await mcpManager.reconcileBrowserFilter(enabled);
-						return mcpManager.getTools();
+						await mcpManager!.reconcileBrowserFilter(enabled);
+						return mcpManager!.getTools();
 					}
 				: undefined,
 			memoryEnabled: !restrictToolNames,
@@ -4770,7 +4859,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			reconcileSettingsGatedTools,
 			getMcpServerInstructions: mcpManager
 				? () => {
-						const raw = mcpManager.getServerInstructions();
+						const raw = mcpManager!.getServerInstructions();
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
@@ -4782,7 +4871,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						return out;
 					}
 				: undefined,
-			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
+			mcpManager: nativeMCPLifecycle ? undefined : mcpManager,
+			nativeMCPLifecycle,
+			disconnectOwnedMcpManager: nativeMCPLifecycle
+				? () => nativeMCPLifecycle!.revoke()
+				: ownedMcpManager
+					? () => ownedMcpManager.disconnectAll()
+					: undefined,
 			ttsrManager,
 			obfuscator,
 			agentId: resolvedAgentId,
@@ -4900,6 +4995,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const existingTool = toolRegistry.get(name);
 				const previousExtensionMcpTool = session.getExtensionMCPTool(name);
 				const wasMcpManagerTool = session.hasMCPManagerTool(name);
+				if (nativeMCPLifecycle && wasMcpManagerTool) {
+					throw new MCPBootstrapError(
+						"conflict",
+						"Extension registration cannot shadow a guarded native MCP tool",
+					);
+				}
 				if (existingTool) {
 					// RPC host tools and SDK custom tools retain their startup precedence when an
 					// extension registers the same name later.
@@ -5104,9 +5205,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// process-exit paths tear the listener down. Nulled after use so the closure
 		// graph (`extensionRunner`, `session`) can be GC'd instead of retained by the
 		// process-global postmortem list.
-		let unsubscribeMcpNotifications: (() => void) | undefined;
-		let unregisterMcpPostmortem: (() => void) | undefined;
-
 		{
 			const originalDispose = session.dispose.bind(session);
 			let tinyClientReleased = false;
@@ -5159,6 +5257,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// Drop refs so the process-global postmortem list doesn't retain
 					// the bridge closure past explicit dispose.
 					unsubscribeMcpNotifications = undefined;
+					attachMcpNotifications = undefined;
 					unregisterMcpPostmortem = undefined;
 				}
 			};
@@ -5388,7 +5487,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		//     an MCP manager (fresh OR reused) needs its own bridge to its own
 		//     `extensionRunner` so extensions loaded in that session receive frames.
 		//     Guarded only by `mcpManager` (see the second `if` below).
-		if (mcpManager && !options.mcpManager) {
+		if (mcpManager && !options.mcpManager && !nativeMCPLifecycle) {
 			mcpManager.setOnToolsChanged(async tools => {
 				try {
 					await session.refreshMCPTools(tools);
@@ -5400,7 +5499,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 			// Wire prompt refresh → rebuild MCP prompt slash commands
 			mcpManager.setOnPromptsChanged(serverName => {
-				const promptCommands = buildMCPPromptCommands(mcpManager);
+				const promptCommands = buildMCPPromptCommands(mcpManager!);
 				session.setMCPPromptCommands(promptCommands);
 				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
 			});
@@ -5434,7 +5533,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 			});
 			// Live resource subscribe/unsubscribe as `mcp.notifications` flips.
-			cfgMcpNotifications.listen(session, enabled => mcpManager.setNotificationsEnabled(enabled));
+			cfgMcpNotifications.listen(session, enabled => mcpManager!.setNotificationsEnabled(enabled));
 		}
 
 		if (mcpManager) {
@@ -5450,9 +5549,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// `addNotificationListener` subscriber (drains here); ExtensionRunner
 			// buffers frames received before `initialize()` and drains them on
 			// init. Both drop-oldest under pressure at cap 100.
-			unsubscribeMcpNotifications = mcpManager.addNotificationListener((server, method, params) => {
-				void extensionRunner.emitMcpNotification({ server, method, params });
-			});
+			let subscribedManager: MCPManager | undefined;
+			attachMcpNotifications = manager => {
+				if (manager === subscribedManager) return;
+				unsubscribeMcpNotifications?.();
+				unsubscribeMcpNotifications = undefined;
+				subscribedManager = manager;
+				if (manager && !session.isDisposed) {
+					unsubscribeMcpNotifications = manager.addNotificationListener((server, method, params) => {
+						void extensionRunner.emitMcpNotification({ server, method, params });
+					});
+				}
+			};
+			attachMcpNotifications(mcpManager);
 			// postmortem.register returns a cancel function; capture it so explicit
 			// session.dispose can remove this from the global list (see finally above).
 			unregisterMcpPostmortem = postmortem.register("mcp-notification-listener-cleanup", () =>
@@ -5460,7 +5569,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			);
 		}
 
-		if (mcpManager && !options.mcpManager) {
+		if (mcpManager && !options.mcpManager && !nativeMCPLifecycle) {
 			// The owning session keeps project `.mcp.json` servers in step with
 			// `mcp.enableProjectConfig` without a `/mcp reload`.
 			const ownedMCPManager = mcpManager;
@@ -5499,6 +5608,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			subagentEventBus,
 		};
 	} catch (error) {
+		const guardedCleanup = nativeMCPLifecycle?.revoke();
 		try {
 			if (hasSession) {
 				await session.dispose();
@@ -5521,6 +5631,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 			});
 		}
+		await guardedCleanup;
 		throw error;
 	}
 }

@@ -12,6 +12,16 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import {
+	cancelMCPToolDispatch,
+	carryMCPExecutionContext,
+	getMCPExecutionInvocation,
+	getMCPToolOrigin,
+	hasMCPToolDispatch,
+	linkMCPToolWrapper,
+	permitMCPToolExecution,
+	reserveMCPToolDispatch,
+} from "../../mcp/invocation";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
 	denyError,
@@ -83,6 +93,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		private runner: ExtensionRunner,
 	) {
 		applyToolProxy(registeredTool.definition, this);
+		linkMCPToolWrapper(this, registeredTool.definition);
 		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
 
 		// Only define render methods when the underlying definition provides them.
@@ -121,18 +132,14 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		// call, so a bare `ctx.invokeTool(params)` keeps the caller's `toolCall`/provider metadata
 		// (write/edit LSP batching, computer safety acknowledgement), stops when the outer call is
 		// aborted, and still streams native progress.
-		return this.registeredTool.definition.execute(
-			toolCallId,
-			params,
+		const extensionContext = this.runner.createContext(undefined, {
+			toolName: this.registeredTool.definition.name,
+			context,
 			signal,
 			onUpdate,
-			this.runner.createContext(undefined, {
-				toolName: this.registeredTool.definition.name,
-				context,
-				signal,
-				onUpdate,
-			}),
-		);
+		});
+		carryMCPExecutionContext(context, extensionContext);
+		return this.registeredTool.definition.execute(toolCallId, params, signal, onUpdate, extensionContext);
 	}
 }
 
@@ -217,6 +224,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	) {
 		this.#agent = agent;
 		applyToolProxy(tool, this);
+		linkMCPToolWrapper(this, tool);
 	}
 
 	/**
@@ -242,12 +250,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// the loop never saw — nested xd:// device dispatches and direct
 		// (non-loop) execution such as Cursor exec handlers.
 		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
-		const loopDispatchedToolCall =
+		const loopSawToolCall =
 			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
+		const mcpOrigin = getMCPToolOrigin(this.tool);
+		// A write loop marker follows xd:// dispatch, but only the native tool's
+		// own private reservation proves its preflight already ran in the loop.
+		const loopDispatchedToolCall = loopSawToolCall && (!mcpOrigin || hasMCPToolDispatch(this.tool, toolCallId));
 		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
 			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
 		}
 		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
+		if (mcpOrigin && !loopDispatchedToolCall) reserveMCPToolDispatch(this.tool, toolCallId, signal);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
@@ -257,6 +270,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		);
 		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
 		if (preResolved.policy === "deny") {
+			if (mcpOrigin) cancelMCPToolDispatch(this.tool, toolCallId);
 			throw denyError(preResolved, this.tool.name);
 		}
 
@@ -271,6 +285,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		let pendingAdditionalContext: string | undefined;
 		let effectiveParams = params;
 		const cancelPreflight = (): void => {
+			if (mcpOrigin) cancelMCPToolDispatch(this.tool, toolCallId);
 			if (!loopDispatchedToolCall) this.runner.cancelToolCallPreflight?.(toolCallId);
 		};
 		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
@@ -278,6 +293,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				const callResult = (await this.runner.emitToolCall(
 					{
 						type: "tool_call",
+						...(mcpOrigin ? { mcpOrigin } : undefined),
 						toolName: this.tool.name,
 						toolCallId,
 						input: normalizeToolEventInput(
@@ -304,6 +320,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					effectiveParams = callResult.input as typeof params;
 				}
 			} catch (err) {
+				cancelPreflight();
 				if (err instanceof Error) {
 					throw err;
 				}
@@ -443,6 +460,15 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		// A context copy is observational only; its native permit is held separately.
+		if (mcpOrigin) {
+			if (context) context = { ...context };
+			else {
+				const base = this.runner.createContext();
+				context = { ...base, hasQueuedMessages: base.hasPendingMessages };
+			}
+			permitMCPToolExecution(this.tool, toolCallId, context);
+		}
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
@@ -474,6 +500,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const resultResult = await this.runner.emitToolResult(
 				{
 					type: "tool_result",
+					...(mcpOrigin ? { mcpOrigin, mcpInvocation: getMCPExecutionInvocation(context) } : undefined),
 					toolName: this.tool.name,
 					toolCallId,
 					input: normalizeToolEventInput(

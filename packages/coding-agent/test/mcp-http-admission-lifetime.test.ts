@@ -63,9 +63,15 @@ describe("guarded HTTP logical request budget", () => {
 		const owner = new AbortController();
 		const entered = Promise.withResolvers<void>();
 		const allow = Promise.withResolvers<Record<string, string> | null>();
-		const f = await fixture(60, () => new Response(null, { status: 401 }), {
+		// Leave setup headroom for real loopback I/O; the native deadline must
+		// expire while auth is held, not before the fixture reaches the hook.
+		const f = await fixture(1_000, () => new Response(null, { status: 401 }), {
 			signal: owner.signal,
 			beforeSend() {},
+		});
+		cleanups.push(() => {
+			owner.abort();
+			allow.resolve(null);
 		});
 		let effectiveSignal: AbortSignal | undefined;
 		f.transport.onAuthError = signal => {

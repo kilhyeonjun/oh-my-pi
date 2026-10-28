@@ -114,7 +114,7 @@ describe("MCP catalog-change after connect", () => {
 	it("repaints after reconnect catalogs finish, then stops after dashboard dispose", async () => {
 		const settings = await Settings.init({ inMemory: true, cwd: workDir });
 		const dashboard = await ExtensionDashboard.create({
-			runtime: createExtensionDashboardRuntime({ cwd: workDir, settings, mcpManager: manager }),
+			runtime: createExtensionDashboardRuntime({ cwd: workDir, settings, getMcpManager: () => manager }),
 		});
 		let paints = 0;
 		dashboard.onRequestRender = () => {

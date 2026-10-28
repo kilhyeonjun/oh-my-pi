@@ -14,6 +14,7 @@
  */
 
 import { runMCPAdmission } from "../admission";
+import { checkMCPSendCustody, type MCPSendCustody } from "../invocation";
 import { MCPAdmissionError } from "../errors";
 import { getNeverAbortSignal } from "../timeout";
 import type { MCPTransportOptions } from "../types";
@@ -83,6 +84,53 @@ export function withoutHeader(
 
 const REDIRECT_STATUSES: Record<number, true> = { 301: true, 302: true, 303: true, 307: true, 308: true };
 const MAX_REDIRECT_HOPS = 5;
+const FORBIDDEN_AUTH_HEADERS: Record<string, true> = {
+	host: true,
+	"content-length": true,
+	"transfer-encoding": true,
+	connection: true,
+	upgrade: true,
+	expect: true,
+	accept: true,
+	"content-type": true,
+	"last-event-id": true,
+	"mcp-session-id": true,
+	"mcp-protocol-version": true,
+	trailer: true,
+	te: true,
+};
+
+/** Snapshot host output without invoking accessors or retaining private errors. */
+function snapshotAuthHeaders(value: unknown): Readonly<Record<string, string>> {
+	try {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) throw new MCPAdmissionError();
+		const headers: Record<string, string> = {};
+		const names: Record<string, true> = {};
+		for (const key of Reflect.ownKeys(value)) {
+			if (typeof key !== "string") throw new MCPAdmissionError();
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !("value" in descriptor)) throw new MCPAdmissionError();
+			if (!descriptor.enumerable) continue;
+			const header: unknown = descriptor.value;
+			const lower = key.toLowerCase();
+			if (
+				typeof header !== "string" ||
+				!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) ||
+				FORBIDDEN_AUTH_HEADERS[lower] ||
+				lower.startsWith("proxy-") ||
+				lower.startsWith("mcp-") ||
+				names[lower]
+			)
+				throw new MCPAdmissionError();
+			new Headers([[key, header]]);
+			names[lower] = true;
+			Object.defineProperty(headers, key, { value: header, enumerable: true });
+		}
+		return Object.freeze(headers);
+	} catch {
+		throw new MCPAdmissionError();
+	}
+}
 
 export interface MCPFetchInit {
 	method: "GET" | "POST" | "DELETE";
@@ -115,8 +163,15 @@ export async function mcpFetch(
 	transport: "http" | "sse" = "http",
 	onCallback?: (pending: boolean) => void,
 	onSend?: () => void,
+	custody?: MCPSendCustody,
+	onAuthResolve?: (pending: Promise<unknown>) => void,
 ): Promise<Response> {
 	const beforeSend = options?.beforeSend;
+	const resolveAuthHeaders = options?.resolveAuthHeaders;
+	if (resolveAuthHeaders && (transport !== "http" || !originLocked || !beforeSend)) throw new MCPAdmissionError();
+	const authSources = resolveAuthHeaders
+		? { generated: { ...sources.generated }, configured: sources.configured ? { ...sources.configured } : undefined }
+		: undefined;
 	if (beforeSend && !originLocked) throw new MCPAdmissionError();
 	// Only guarded sends snapshot the wire fields; strings are already serialized.
 	if (beforeSend) init = Object.freeze({ method: init.method, body: init.body, signal: init.signal });
@@ -132,10 +187,19 @@ export async function mcpFetch(
 	let currentUrl = url;
 	for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
 		const attachConfigured = new URL(currentUrl).origin === configuredOrigin;
-		const headers = mergeMCPHeaders(attachConfigured ? sources : { generated: sources.generated });
+		let headers = mergeMCPHeaders(attachConfigured ? sources : { generated: sources.generated });
 		if (beforeSend) {
 			const signal = init.signal ?? getNeverAbortSignal();
-			const event = Object.freeze({ transport, url: currentUrl, method: init.method, body: init.body, signal });
+			if (custody) checkMCPSendCustody(custody, currentUrl, init.body);
+			const event = Object.freeze({
+				transport,
+				url: currentUrl,
+				method: init.method,
+				body: init.body,
+				signal,
+				...(custody ? { association: custody.association, wireId: custody.wireId } : undefined),
+				...(resolveAuthHeaders ? { admissionPhase: "prepare" as const } : undefined),
+			});
 			await runMCPAdmission(signal, async () => {
 				onCallback?.(true);
 				try {
@@ -145,13 +209,56 @@ export async function mcpFetch(
 				}
 			});
 			signal.throwIfAborted();
+			if (resolveAuthHeaders) {
+				if (custody) checkMCPSendCustody(custody, currentUrl, init.body);
+				const resolverEvent = Object.freeze({
+					transport: "http" as const,
+					url: currentUrl,
+					method: init.method,
+					signal,
+					...(custody ? { association: custody.association } : undefined),
+				});
+				const pending = Promise.resolve()
+					.then(() => {
+						signal.throwIfAborted();
+						return resolveAuthHeaders(resolverEvent);
+					})
+					.then(snapshotAuthHeaders, () => {
+						throw new MCPAdmissionError();
+					});
+				onAuthResolve?.(pending);
+				let resolved: Readonly<Record<string, string>> | undefined;
+				await runMCPAdmission(signal, async () => {
+					resolved = await pending;
+				});
+				signal.throwIfAborted();
+				if (custody) checkMCPSendCustody(custody, currentUrl, init.body);
+				const configured = { ...authSources!.configured };
+				for (const [name, value] of Object.entries(resolved ?? {})) setGeneratedHeader(configured, name, value);
+				headers = mergeMCPHeaders({ generated: authSources!.generated, configured });
+				const finalEvent = Object.freeze({ ...event, admissionPhase: "final" as const });
+				await runMCPAdmission(signal, async () => {
+					onCallback?.(true);
+					try {
+						return await beforeSend(finalEvent);
+					} finally {
+						onCallback?.(false);
+					}
+				});
+				signal.throwIfAborted();
+			}
 		}
 		if (onSend) {
 			if (!beforeSend) init.signal?.throwIfAborted();
 			onSend();
 		}
+		if (custody) checkMCPSendCustody(custody, currentUrl, init.body);
 		const response = await fetch(currentUrl, { ...init, headers, redirect: "manual", timeout: false });
 		if (!REDIRECT_STATUSES[response.status]) return response;
+		if (resolveAuthHeaders) {
+			await response.body?.cancel();
+			throw new MCPAdmissionError();
+		}
 
 		const location = response.headers.get("Location");
 		if (!location) return response;

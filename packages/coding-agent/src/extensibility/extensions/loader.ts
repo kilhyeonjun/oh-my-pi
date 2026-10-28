@@ -27,6 +27,8 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import type { MCPSessionBootstrap } from "../../mcp/bootstrap";
+import { registerMCPBootstrap, closeMCPBootstrapRegistration } from "../../mcp/session-binding";
 import type { SendUserMessageOptions } from "../../session/agent-session";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
@@ -177,6 +179,13 @@ export class ExtensionRuntime implements IExtensionRuntime {
  * Action methods delegate to the shared runtime.
  */
 class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+	#mcpFactoryOpen = true;
+	readonly #bootstrapExtension: Extension;
+	readonly #bootstrapSource: string;
+	static sealMCPBootstrapFactory(api: ConcreteExtensionAPI, succeeded: boolean): void {
+		api.#mcpFactoryOpen = false;
+		closeMCPBootstrapRegistration(api.#bootstrapExtension, succeeded);
+	}
 	readonly logger = logger;
 	readonly typebox = TypeBox;
 	readonly arktype = type;
@@ -195,6 +204,8 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {
+		this.#bootstrapExtension = extension;
+		this.#bootstrapSource = extension.resolvedPath;
 		// Extensions destructure `pi.on` or forward API methods as callbacks, so every
 		// prototype method must keep its receiver when detached. Walk the prototype
 		// rather than listing methods: a new method is bound without touching this.
@@ -205,6 +216,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 			if (typeof descriptor?.value !== "function") continue;
 			Object.defineProperty(this, name, { value: descriptor.value.bind(this), writable: true, configurable: true });
 		}
+	}
+
+	registerMCPSessionBootstrap(bootstrap: MCPSessionBootstrap): void {
+		registerMCPBootstrap(this.#bootstrapExtension, this.#bootstrapSource, bootstrap, this.#mcpFactoryOpen);
 	}
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
@@ -396,19 +411,20 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
  */
 async function runExtensionFactory(
 	factory: ExtensionFactory,
-	api: ExtensionAPI,
+	api: ConcreteExtensionAPI,
 	runtime: IExtensionRuntime,
 ): Promise<void> {
 	const providerRegistrationCheckpoint = [...runtime.pendingProviderRegistrations];
-
 	try {
 		await factory(api);
+		ConcreteExtensionAPI.sealMCPBootstrapFactory(api, true);
 	} catch (error) {
 		runtime.pendingProviderRegistrations.splice(
 			0,
 			runtime.pendingProviderRegistrations.length,
 			...providerRegistrationCheckpoint,
 		);
+		ConcreteExtensionAPI.sealMCPBootstrapFactory(api, false);
 		throw error;
 	}
 }

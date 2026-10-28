@@ -2,6 +2,8 @@ import type { SourceMeta } from "../../../capability/types";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import { type LoadMCPConfigsOptions, loadAllMCPConfigs } from "../../../mcp/config";
 import type { MCPLoadResult } from "../../../mcp/manager";
+import { MCPBootstrapError } from "../../../mcp/bootstrap";
+import { getMCPManagerBinding } from "../../../mcp/session-binding";
 import type { McpConnectionStatusEvent } from "../../../mcp/startup-events";
 import type { MCPServerConfig } from "../../../mcp/types";
 
@@ -41,6 +43,8 @@ export interface ApplyMcpToggleRuntimeOptions {
 export async function applyMcpToggleRuntime(options: ApplyMcpToggleRuntimeOptions): Promise<void> {
 	const { name, enabled, cwd, manager, session, discovery, loadConfigs = loadAllMCPConfigs, onStatus } = options;
 	if (!manager) return;
+	if (getMCPManagerBinding(manager))
+		throw new MCPBootstrapError("conflict", "This MCP session has a sealed native source selection");
 
 	if (!enabled) {
 		await manager.disconnectServer(name);

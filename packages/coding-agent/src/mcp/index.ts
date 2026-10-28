@@ -5,6 +5,8 @@
  * MCP servers via stdio or HTTP transports.
  */
 
+// Public bootstrap contracts; native ownership and mint helpers stay internal.
+export * from "./bootstrap";
 // Client
 export * from "./client";
 // Config

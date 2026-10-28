@@ -24,6 +24,8 @@ export {
 	type AssistantThinkingRenderContext,
 	type AssistantThinkingRenderer,
 } from "@oh-my-pi/pi-tui/chat/extension-types";
+import type { MCPSessionBootstrap } from "../../mcp/bootstrap";
+import type { MCPToolOrigin, MCPInvocationIdentity } from "../../mcp/types";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
@@ -961,6 +963,7 @@ export interface SourceInfo {
 
 /** Tool metadata returned by {@link ExtensionAPI.getAllTools}: identity, schema, and source provenance. */
 export interface ToolInfo {
+	readonly mcpOrigin?: MCPToolOrigin;
 	name: string;
 	description: string;
 	parameters: TSchema;
@@ -1306,6 +1309,7 @@ export interface PlanReviewResolvedEvent {
 interface ToolCallEventBase {
 	type: "tool_call";
 	toolCallId: string;
+	readonly mcpOrigin?: MCPToolOrigin;
 }
 
 export interface BashToolCallEvent extends ToolCallEventBase {
@@ -1356,6 +1360,8 @@ export type ToolCallEvent =
 interface ToolResultEventBase {
 	type: "tool_result";
 	toolCallId: string;
+	readonly mcpOrigin?: MCPToolOrigin;
+	readonly mcpInvocation?: MCPInvocationIdentity;
 	input: Record<string, unknown>;
 	content: (TextContent | ImageContent)[];
 	isError: boolean;
@@ -1597,6 +1603,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
  * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
+	/** Declare the native MCP bootstrap while this factory is being bound. */
+	registerMCPSessionBootstrap(bootstrap: MCPSessionBootstrap): void;
 	// =========================================================================
 	// Module Access
 	// =========================================================================
