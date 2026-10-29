@@ -761,7 +761,12 @@ export class HttpTransport implements MCPTransport {
 			stage = "decode";
 			// Handle JSON response
 			const result: unknown = await response.json();
-			if (!isRecord(result) || result.jsonrpc !== "2.0" || (!("result" in result) && !("error" in result))) {
+			if (
+				!isRecord(result) ||
+				result.jsonrpc !== "2.0" ||
+				result.id !== id ||
+				(!("result" in result) && !("error" in result))
+			) {
 				throw new SyntaxError("Malformed JSON-RPC response");
 			}
 			if (result.error !== undefined) {

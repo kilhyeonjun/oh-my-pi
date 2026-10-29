@@ -105,7 +105,7 @@ Unknown response IDs are ignored (no rejection, no error callback).
 ## HTTP correlation path
 
 - Outbound request is HTTP `POST` with JSON body and generated `id`.
-- Non-SSE response path: validate and parse one JSON-RPC response and return `result`/throw on `error`; this path does not verify the response ID.
+- Non-SSE response path: validate one JSON-RPC response and require its `id` to equal the allocated request ID strictly, including number/string type, before returning `result` or processing `error`. Missing, null, wrong-value and wrong-type IDs fail at `decode` as nonretryable `malformed_response`, before tool-result authentication challenges can reconnect or replay. A local invocation identity is not a substitute for this wire correlation.
 - SSE response path (`Content-Type: text/event-stream`): stream events, return first message whose `id` matches expected request ID and has `result` or `error`.
 - SSE messages with `method` and no `id` are treated as notifications.
 - SSE messages with both `method` and `id` are treated as server-to-client requests and answered with a POSTed JSON-RPC response.

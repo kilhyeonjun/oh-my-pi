@@ -4,6 +4,7 @@
 
 ### Changed
 
+- The separate KH HTTP response-correlation patch reports `18.11.3-kh-mcp.2`; it does not rewrite the fixed `.1` source or binary. The new source, patch, signed-build digest and artifact registration require their own provenance and checks before adoption.
 - KH local runtime builds based on reviewed MCP admission revision `3bd046f15173649e1b6176dd47874bc74aaa5e6c` report `18.11.3-kh-mcp.1`. Matching workspace/catalog lock metadata keeps the local utility package selected. This label is not an official upstream release; source patch, signed build digest and normal KH artifact registration remain separate provenance and activation requirements.
 
 ## [18.11.3] - 2026-10-16

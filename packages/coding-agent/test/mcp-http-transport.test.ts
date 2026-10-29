@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { connectToServer } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import { analyzeAuthError } from "@oh-my-pi/pi-coding-agent/mcp/oauth-discovery";
+import { MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
+import type { MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { postmortem } from "@oh-my-pi/pi-utils";
 
 const encoder = new TextEncoder();
@@ -20,12 +23,16 @@ afterEach(() => {
 	server = null;
 });
 
-async function connectedTransport(timeout = REQUEST_TIMEOUT_MS): Promise<HttpTransport> {
+async function connectedTransport(
+	timeout = REQUEST_TIMEOUT_MS,
+	requestIdFormat?: "number" | "string",
+): Promise<HttpTransport> {
 	if (!server) throw new Error("Test server was not started");
 	const transport = new HttpTransport({
 		type: "http",
 		url: `http://127.0.0.1:${server.port}/mcp`,
 		timeout,
+		requestIdFormat,
 	});
 	await transport.connect();
 	return transport;
@@ -144,6 +151,161 @@ describe("MCP Streamable HTTP initialization", () => {
 		controller.abort();
 		await expect(withPendingGuard(connection, "handshake")).rejects.toMatchObject({ name: "AbortError" });
 	});
+});
+
+describe("MCP Streamable HTTP JSON response correlation", () => {
+	it.each(["number", "string"] as const)("accepts a matching %s request ID", async requestIdFormat => {
+		let posts = 0;
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				posts++;
+				const body = (await req.json()) as { id: string | number };
+				if (typeof body.id !== requestIdFormat) return new Response(null, { status: 400 });
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { content: [{ type: "text", text: "completed" }] },
+				});
+			},
+		});
+		const transport = await connectedTransport(0, requestIdFormat);
+		const connection: MCPServerConnection = {
+			name: "json-correlation",
+			config: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` },
+			transport,
+			serverInfo: { name: "json-correlation", version: "1.0" },
+			capabilities: { tools: {} },
+		};
+		const tool = new MCPTool(connection, { name: "read", inputSchema: { type: "object" } });
+		try {
+			const result = await tool.execute("correlated-read", {}, undefined, {} as CustomToolContext);
+			expect(result.isError).not.toBe(true);
+			expect(posts).toBe(1);
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it.each(["missing", "null", "wrong value", "same text, wrong type"] as const)(
+		"rejects a %s response ID without retrying",
+		async kind => {
+			let posts = 0;
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(req) {
+					posts++;
+					const body = (await req.json()) as { id: number };
+					const id = kind === "null" ? null : kind === "wrong value" ? body.id + 1 : String(body.id);
+					return Response.json({
+						jsonrpc: "2.0",
+						...(kind === "missing" ? {} : { id }),
+						result: { tools: [] },
+					});
+				},
+			});
+			const transport = await connectedTransport(0, "number");
+			try {
+				await expect(transport.request("tools/list")).rejects.toMatchObject({
+					transport: "http",
+					stage: "decode",
+					failure: "malformed_response",
+					retryable: false,
+				});
+				expect(posts).toBe(1);
+			} finally {
+				await transport.close();
+			}
+		},
+	);
+
+	it.each([true, false])(
+		"checks correlation before processing a JSON-RPC 401 error (matching: %s)",
+		async matching => {
+			let posts = 0;
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(req) {
+					posts++;
+					const body = (await req.json()) as { id: number };
+					return Response.json({
+						jsonrpc: "2.0",
+						id: matching ? body.id : body.id + 1,
+						error: { code: 401, message: "Unauthorized" },
+					});
+				},
+			});
+			const transport = await connectedTransport(0, "number");
+			try {
+				await expect(transport.request("tools/call", { name: "write", arguments: {} })).rejects.toMatchObject({
+					transport: "http",
+					stage: matching ? "protocol" : "decode",
+					failure: matching ? "json_rpc" : "malformed_response",
+					retryable: false,
+					...(matching ? { code: 401 } : {}),
+				});
+				expect(posts).toBe(1);
+			} finally {
+				await transport.close();
+			}
+		},
+	);
+
+	it.each([true, false])(
+		"allows ordinary tool auth retry only for a correlated challenge result (matching: %s)",
+		async matching => {
+			let posts = 0;
+			const challenge = { wwwAuthenticate: ['Bearer scope="write"'] };
+			server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(req) {
+					posts++;
+					const body = (await req.json()) as { id: number; method: string };
+					return Response.json({
+						jsonrpc: "2.0",
+						id: matching ? body.id : body.id + 1,
+						result:
+							posts === 1
+								? {
+										content: [{ type: "text", text: "Authorization required" }],
+										isError: true,
+										_meta: { "mcp/www_authenticate": challenge.wwwAuthenticate },
+									}
+								: { content: [{ type: "text", text: "write completed" }] },
+					});
+				},
+			});
+			const transport = await connectedTransport(0, "number");
+			const connection: MCPServerConnection = {
+				name: "json-correlation",
+				config: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` },
+				transport,
+				serverInfo: { name: "json-correlation", version: "1.0" },
+				capabilities: { tools: {} },
+			};
+			const reconnect = vi.fn(async () => connection);
+			const tool = new MCPTool(connection, { name: "write", inputSchema: { type: "object" } }, reconnect);
+			try {
+				const result = await tool.execute("write-call", {}, undefined, {} as CustomToolContext);
+				if (matching) {
+					expect(reconnect).toHaveBeenCalledTimes(1);
+					expect(posts).toBe(2);
+					expect(result.isError).not.toBe(true);
+				} else {
+					expect(reconnect).not.toHaveBeenCalled();
+					expect(posts).toBe(1);
+					expect(result.isError).toBe(true);
+					expect(result.details?.mcpMeta).toBeUndefined();
+				}
+			} finally {
+				await transport.close();
+			}
+		},
+	);
 });
 
 describe("MCP Streamable HTTP failure diagnostics", () => {
@@ -637,12 +799,14 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 
 describe("MCP Streamable HTTP protocol version header", () => {
 	it("never lets a configured MCP-Protocol-Version reach the server", async () => {
-		const seen: { pre: string | null; post: string | null } = { pre: null, post: null };
+		const seen: (string | null)[] = [];
 		server = Bun.serve({
+			hostname: "127.0.0.1",
 			port: 0,
-			fetch(req) {
-				const body = req.headers.get("MCP-Protocol-Version");
-				return Response.json({ jsonrpc: "2.0", id: 1, result: { seen: body } });
+			async fetch(req) {
+				const { id } = (await req.json()) as { id: number | string };
+				seen.push(req.headers.get("MCP-Protocol-Version"));
+				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});
 		if (!server) throw new Error("Test server was not started");
@@ -655,17 +819,12 @@ describe("MCP Streamable HTTP protocol version header", () => {
 		await transport.connect();
 
 		// Pre-negotiation: configured header must be stripped, not leaked.
-		seen.pre = await withPendingGuard(transport.request<{ seen: string | null }>("initialize"), "request").then(
-			r => r.seen,
-		);
+		await withPendingGuard(transport.request("initialize"), "request");
 		// Post-negotiation: the negotiated version wins over the configured one.
 		transport.setProtocolVersion("2025-11-25");
-		seen.post = await withPendingGuard(transport.request<{ seen: string | null }>("tools/list"), "request").then(
-			r => r.seen,
-		);
+		await withPendingGuard(transport.request("tools/list"), "request");
 
-		expect(seen.pre).toBeNull();
-		expect(seen.post).toBe("2025-11-25");
+		expect(seen).toEqual([null, "2025-11-25"]);
 	});
 });
 

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject uncorrelated Streamable HTTP JSON replies before result or JSON-RPC error handling. Response IDs must match the allocated numeric or string ID without coercion; malformed replies are nonretryable decode failures rather than successful tool results or authentication-retry triggers.
+
 ### Added
 
 - Trusted extensions can install a session-owned HTTP MCP loader and admission before discovery, inspect native original-tool/invocation custody, and resolve host auth headers only at physical sends with final policy revalidation; stale, forged and cross-session execution refuses without changing ordinary callers.
